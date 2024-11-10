@@ -12,6 +12,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Instant;
 
 use mio::net::{TcpListener, TcpStream};
 use mio::{Poll, Events, Interest, Token};
@@ -19,7 +20,7 @@ use mio::{Poll, Events, Interest, Token};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection};
 
-type Handler = &'static dyn Fn(Request) -> Response;
+type Handler<'a> = &'a dyn Fn(Request) -> Response;
 
 pub trait From {
     
@@ -57,14 +58,14 @@ impl Read for EncryptedStream {
     }
 }
 
-pub struct Service {
+pub struct Service<'a> {
     path: PathBuf,
     method: Method,
-    handler: Handler,
+    handler: Handler<'a>,
 }
 
-impl Service {
-    pub fn new(path_str: &str, method: Method, handler: Handler ) -> Self {
+impl<'a> Service<'a> {
+    pub fn new(path_str: &str, method: Method, handler: Handler<'a> ) -> Self {
         Service {
             path: path_str.parse().unwrap(),
             method,
@@ -73,13 +74,13 @@ impl Service {
     }
 }
 
-pub struct Server {
+pub struct Server<'a> {
     address: SocketAddr,
-    services: Vec<Service>,
+    services: Vec<Service<'a>>,
     not_found: Vec<u8>,
 }
 
-impl Server {
+impl<'a> Server<'a> {
     pub fn new(address_str: &str) -> Server {
         Server {
             address: address_str.parse().unwrap(),
@@ -87,14 +88,14 @@ impl Server {
             not_found: Vec::new(),
         }
     }
-    pub fn add_service(&mut self, service: Service) {
+    pub fn add_service(&mut self, service: Service<'a>) {
         self.services.push(service);
     }
     pub fn add_404_page(&mut self, path: &Path) {
         self.not_found = fs::read(path).expect("custom 404 page should exist at the specified path");
     }
     pub fn serve(&self) -> Result<(), Box<dyn Error>> {
-        self.generic_serve(&|stream: TcpStream| -> TcpStream { stream })
+        self.generic_serve(&|stream: TcpStream| stream)
     }
     pub fn serve_with_tls(&self, domain_cert: Vec<CertificateDer<'static>>, private_key: PrivateKeyDer<'static>) -> Result<(), Box<dyn Error>> {
         let config = ServerConfig::builder()
@@ -149,6 +150,7 @@ impl Server {
                         }
                     },
                     token => {
+                        let start_time = Instant::now();
                         let connection = connections.get(token).unwrap();
                         //println!("check 1");
                         match connection.read(&mut read_buffer) {
@@ -176,6 +178,7 @@ impl Server {
                                         break
                                     }
                                 }
+                                println!("time: {:?}", start_time.elapsed());
                                 break
                             },
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
@@ -310,7 +313,7 @@ impl Response {
         data.append(&mut "Expires: Wed, 21 Oct 2055 07:28:00 GMT".to_owned().into_bytes());
         data.append(&mut "\r\n\r\n".to_owned().into_bytes());
 
-        data.append(&mut self.payload.to_owned());
+        data.extend_from_slice(&self.payload);
 
         data
     }
