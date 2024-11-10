@@ -1,8 +1,21 @@
 use std::fs;
 use std::path::{Path, PathBuf, Component};
 
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
 use crate::library::*;
 
+pub fn get_domain_certs(path: &str) -> Vec<CertificateDer> {
+    CertificateDer::pem_file_iter(path)
+        .unwrap()
+        .map(|cert| cert.unwrap())
+        .collect()
+}
+
+pub fn get_private_key(path: &str) -> PrivateKeyDer<'_> {
+    PrivateKeyDer::from_pem_file(path).unwrap()
+}
 
 fn path_is_sane(path: &Path) -> bool {
     let mut sane = true;

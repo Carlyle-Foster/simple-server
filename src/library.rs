@@ -1,9 +1,7 @@
 #![allow(nonstandard_style)]
 #![allow(unused_braces)]
 
-pub mod implementation;
-use implementation::Client;
-
+use std::io;
 use core::str;
 use std::collections::HashMap;
 use std::io::{Write, ErrorKind};
@@ -15,14 +13,49 @@ use std::path::PathBuf;
 use std::error::Error;
 use std::sync::Arc;
 
-use mio::net::{TcpListener};
+use mio::net::{TcpListener, TcpStream};
 use mio::{Poll, Events, Interest, Token};
 
-//use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ServerConfig};
+use rustls::{ServerConfig, ServerConnection};
 
 type Handler = &'static dyn Fn(Request) -> Response;
+
+pub trait From {
+    
+}
+
+pub struct EncryptedStream {
+    pub stream: TcpStream,
+    pub tls_layer: ServerConnection,
+}
+
+impl Write for EncryptedStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut writer = self.tls_layer.writer();
+        writer.write(buf)?;
+        match self.tls_layer.complete_io(&mut self.stream) {
+            Ok((bytes_written, _)) => {
+                Ok(bytes_written)
+            },
+            Err(e) => Err(e),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let mut writer = self.tls_layer.writer();
+        writer.flush()?;
+        self.tls_layer.complete_io(&mut self.stream)?;
+        Ok(())
+    }
+}
+
+impl Read for EncryptedStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.tls_layer.complete_io(&mut self.stream)?;
+        let mut reader = self.tls_layer.reader();
+        reader.read(buf)
+    }
+}
 
 pub struct Service {
     path: PathBuf,
@@ -44,7 +77,6 @@ pub struct Server {
     address: SocketAddr,
     services: Vec<Service>,
     not_found: Vec<u8>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Server {
@@ -53,7 +85,6 @@ impl Server {
             address: address_str.parse().unwrap(),
             services: Vec::with_capacity(4),
             not_found: Vec::new(),
-            tls_config: None,
         }
     }
     pub fn add_service(&mut self, service: Service) {
@@ -62,96 +93,31 @@ impl Server {
     pub fn add_404_page(&mut self, path: &Path) {
         self.not_found = fs::read(path).expect("custom 404 page should exist at the specified path");
     }
-    pub fn add_certs(&mut self, domain_cert: Vec<CertificateDer<'static>>, private_key: PrivateKeyDer<'static>) {
-        self.tls_config = 
-            Some(
-                Arc::new(
-                ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_single_cert(domain_cert, private_key)
-                    .unwrap()
-                    )
-                )
+    pub fn serve(&self) -> Result<(), Box<dyn Error>> {
+        self.generic_serve(&|stream: TcpStream| -> TcpStream { stream })
     }
-    pub fn serve(&self) -> Result<(), Box<dyn Error>>  {
-        const SERVER: Token = Token(!0);
-        let mut poll = Poll::new()?;
-        let mut events = Events::with_capacity(128);
-        let mut connections = clientManifest::new(128);
-        let mut server = TcpListener::bind(self.address).expect("this port should be available");
-        let mut read_buffer = [0; 4096];
-
-        poll.registry()
-            .register(&mut server, SERVER, Interest::READABLE)?;
-        println!("listening at address {} on port {}", self.address.ip(), self.address.port());
-        loop {
-            poll.poll(&mut events, None)?;
-            for event in events.iter() {
-                match event.token() {
-                    SERVER => {
-                        loop {
-                            match server.accept() {
-                                Ok((connection, _)) => {
-                                    let (connection, token) = connections.insert(Client::new(connection));
-                                    poll.registry().register(&mut connection.tcp, token, Interest::READABLE | Interest::WRITABLE)?;
-                                }
-                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                                    println!("would block");
-                                    break
-                                },
-                                e => {
-                                    println!("ERROR: {:?}", e);
-                                    break
-                                },
-                            }
-                        }
-                    },
-                    token => {
-                        loop {
-                            let connection = connections.get(token).unwrap();
-                            match connection.tcp.read(&mut read_buffer) {
-                                Ok(bytes_read) => {
-                                    let request_string = str::from_utf8(&read_buffer[0..bytes_read])?;
-                                    //print!("{}\r\nRequest Length: {} bytes", request_string, request_string.len());
-                                    let mut request = match Request::from_data(request_string) {
-                                        Some(request) => request,
-                                        None => break,
-                                    };
-                                    println!("{:#?}", request);
-                                    for service in &self.services {
-                                        println!("service path: {:?}, request path: {:?}", service.path, request.path);
-                                        if request.path.starts_with(&service.path) && (request.method == service.method || service.method == Method::ANY) {
-                                            request.path = request.path.strip_prefix(&service.path).unwrap().to_path_buf();
-                                            let mut response = (service.handler)(request);
-                                            if response.status == Status::NotFound {
-                                                response.payload = self.not_found.clone();
-                                            }
-                                            connection.send(&response.deserialize());
-                                            break
-                                        }
-                                    }
-                                    break
-                                },
-                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                                    break
-                                },
-                                e => {
-                                    println!("ERROR: {:?}", e);
-                                    break
-                                },
-                            }
-                        }
-                    },
-                }
+    pub fn serve_with_tls(&self, domain_cert: Vec<CertificateDer<'static>>, private_key: PrivateKeyDer<'static>) -> Result<(), Box<dyn Error>> {
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(domain_cert, private_key)
+            .unwrap();
+        let config = Arc::new(config);
+        
+        let factory = |stream: TcpStream| -> EncryptedStream {
+            let mut tls_layer =  ServerConnection::new(config.clone()).unwrap();
+            tls_layer.set_buffer_limit(Some(64 * 1024 * 1024));
+            EncryptedStream {
+                stream,
+                tls_layer,
             }
-
-        }
+        };
+        self.generic_serve(&factory)
     }
-    pub fn serve_with_tls(&self) -> Result<(), Box<dyn Error>>  {
+    pub fn generic_serve<Client: Read + Write>(&self, factory: &dyn Fn(TcpStream) -> Client) -> Result<(), Box<dyn Error>>  {
         const SERVER: Token = Token(!0);
         let mut poll = Poll::new()?;
         let mut events = Events::with_capacity(128);
-        let mut connections = clientManifest::new(128);
+        let mut connections = clientManifest::<Client>::new(128);
         let mut server = TcpListener::bind(self.address).expect("this port should be available");
         let mut read_buffer = [0; 4096];
 
@@ -166,9 +132,10 @@ impl Server {
                     SERVER => {
                         loop {
                             match server.accept() {
-                                Ok((connection, _)) => {
-                                    let (connection, token) = connections.insert(Client::new_with_tls(self, connection));
-                                    poll.registry().register(&mut connection.tcp, token, Interest::READABLE | Interest::WRITABLE)?;
+                                Ok((mut connection, _)) => {
+                                    let token = Token(connections.reservation_for_1());
+                                    poll.registry().register(&mut connection, token, Interest::READABLE | Interest::WRITABLE)?;
+                                    connections.insert(factory(connection));
                                 }
                                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                                     println!("would block");
@@ -183,23 +150,8 @@ impl Server {
                     },
                     token => {
                         let connection = connections.get(token).unwrap();
-                        let tls = match &mut connection.tls {
-                            Some(tls) => tls,
-                            None => panic!("expected TLS connection"),
-                        };
-                        match tls.complete_io(&mut connection.tcp) {
-                            Ok((_bytes_read, _bytes_written)) => {},
-                            Err(ref e) if e.kind() == ErrorKind::InvalidData => {
-                                panic!("replaces this panic with a graceful shutdown of the connection: {:?}! 1", e);
-                            }
-                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => continue,
-                            Err(e) => {
-                                println!("ERROR: {:?}", e);
-                                panic!("replaces this panic with a graceful shutdown of the connection: {:?}! 2", e);
-                            }
-                        };
                         //println!("check 1");
-                        match tls.reader().read(&mut read_buffer) {
+                        match connection.read(&mut read_buffer) {
                             Ok(bytes_read) => {
                                 let request_string = str::from_utf8(&read_buffer[0..bytes_read])?;
                                 //print!("{}\r\nRequest Length: {} bytes", request_string, request_string.len());
@@ -216,7 +168,11 @@ impl Server {
                                         if response.status == Status::NotFound {
                                             response.payload = self.not_found.clone();
                                         }
-                                        connection.send_with_tls(&response.deserialize());
+                                        match connection.write(&response.deserialize()) {
+                                            Ok(_) => {},
+                                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
+                                            Err(e) => Err(e).unwrap()
+                                        }
                                         break
                                     }
                                 }
@@ -445,29 +401,33 @@ impl Status {
     }
 }
 
-pub struct clientManifest {
+pub struct clientManifest<Client: Read + Write> {
     contents: Vec<Client>,
     vacancies: Vec<usize>,
 }
 
-impl clientManifest {
-    pub fn new(capacity: usize) -> clientManifest {
-        clientManifest {
+impl<Client: Read + Write> clientManifest<Client> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
             contents: Vec::<Client>::with_capacity(capacity),
             vacancies: Vec::<usize>::with_capacity(capacity),
         }
     }
-    pub fn insert(&mut self, connection: Client) -> (&mut Client, Token) {
+    pub fn reservation_for_1(&mut self) -> usize {
         match self.vacancies.pop() {
-            Some(opening) => {
-                self.contents[opening] = connection;
-                return (&mut self.contents[opening], Token(opening));
-            },
+            Some(vacancy) => vacancy,
             None => {
-                let index = self.contents.len();
-                self.contents.push(connection);
-                return (&mut self.contents[index], Token(index));
+                self.contents.len()
             },
+        }
+    }
+    pub fn insert(&mut self, connection: Client) {
+        let vacancy = self.reservation_for_1();
+        if vacancy == self.contents.len() {
+            self.contents.push(connection);
+        }
+        else {
+            self.contents[vacancy] = connection;
         }
     }
     pub fn get(&mut self, t: Token) -> Option<&mut Client> {
