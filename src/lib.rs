@@ -10,7 +10,6 @@ use std::io::{Write, ErrorKind};
 use std::net::SocketAddr;
 use std::io::Read;
 use std::fs::{self};
-use std::path::Path;
 use std::path::PathBuf;
 use std::error::Error;
 use std::sync::Arc;
@@ -22,7 +21,7 @@ use mio::{Poll, Events, Interest, Token};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection};
 
-type Handler<'a> = &'a dyn Fn(Request) -> Response;
+type Handler = dyn FnMut(Request) -> Response;
 
 pub struct EncryptedStream {
     pub stream: TcpStream,
@@ -59,11 +58,11 @@ impl Read for EncryptedStream {
 pub struct Service<'a> {
     path: PathBuf,
     method: Method,
-    handler: Handler<'a>,
+    handler: &'a mut Handler,
 }
 
 impl<'a> Service<'a> {
-    pub fn new(path_str: &str, method: Method, handler: Handler<'a> ) -> Self {
+    pub fn new(path_str: &str, method: Method, handler: &'a mut Handler ) -> Self {
         Service {
             path: path_str.parse().unwrap(),
             method,
@@ -86,16 +85,18 @@ impl<'a> Server<'a> {
             not_found: Vec::new(),
         }
     }
-    pub fn add_service(&mut self, service: Service<'a>) {
+    pub fn add_service(&mut self, path: &str, method: Method, handler: &'a mut Handler ) {
+        let service = Service::new(path, method, handler);
         self.services.push(service);
     }
-    pub fn add_404_page(&mut self, path: &Path) {
+    pub fn add_404_page(&mut self, path: &str) {
         self.not_found = fs::read(path).expect("custom 404 page should exist at the specified path");
     }
-    pub fn serve(&self) -> Result<(), Box<dyn Error>> {
+    pub fn serve(&mut self) -> Result<(), Box<dyn Error>> {
+        println!("serving HTTP on (http://{}:{})", self.address.ip(), self.address.port());
         self.generic_serve(&|stream: TcpStream| stream)
     }
-    pub fn serve_with_tls(&self, domain_cert: Vec<CertificateDer<'static>>, private_key: PrivateKeyDer<'static>) -> Result<(), Box<dyn Error>> {
+    pub fn serve_with_tls(&mut self, domain_cert: Vec<CertificateDer<'static>>, private_key: PrivateKeyDer<'static>) -> Result<(), Box<dyn Error>> {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(domain_cert, private_key)
@@ -110,9 +111,10 @@ impl<'a> Server<'a> {
                 tls_layer,
             }
         };
+        println!("serving HTTPS on (https://{}:{})", self.address.ip(), self.address.port());
         self.generic_serve(&factory)
     }
-    pub fn generic_serve<Client: Read + Write>(&self, factory: &dyn Fn(TcpStream) -> Client) -> Result<(), Box<dyn Error>>  {
+    pub fn generic_serve<Client: Read + Write>(&mut self, factory: &dyn Fn(TcpStream) -> Client) -> Result<(), Box<dyn Error>>  {
         const SERVER: Token = Token(!0);
         let mut poll = Poll::new()?;
         let mut events = Events::with_capacity(128);
@@ -122,7 +124,6 @@ impl<'a> Server<'a> {
 
         poll.registry()
             .register(&mut server, SERVER, Interest::READABLE)?;
-        println!("listening at address {} on port {}", self.address.ip(), self.address.port());
         loop {
             poll.poll(&mut events, None)?;
             for event in events.iter() {
@@ -160,7 +161,7 @@ impl<'a> Server<'a> {
                                     None => break,
                                 };
                                 println!("{:#?}", request);
-                                for service in &self.services {
+                                for service in &mut self.services {
                                     //println!("service path: {:?}, request path: {:?}", service.path, request.path);
                                     if request.path.starts_with(&service.path) && (request.method == service.method || service.method == Method::ANY) {
                                         request.path = request.path.strip_prefix(&service.path).unwrap().to_path_buf();
