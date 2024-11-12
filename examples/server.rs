@@ -1,10 +1,7 @@
-pub mod library;
-pub mod helpers;
+use std::path::Path;
 
-use std::{fs, path::Path};
-
-use library::{Method, Request, Response, Server, Service};
-use helpers::{IntoResponse, VirtualFile, get_domain_certs, get_private_key};
+use simple_server::{Method, Request, Response, Server, Service};
+use simple_server::helpers::{IntoResponse, VirtualFile, get_domain_certs, get_private_key};
 
 fn main() {
     let mut server = Server::new("127.0.0.1:8783");

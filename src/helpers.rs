@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf, Component};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-use crate::library::*;
+use crate::*;
 
 pub fn get_domain_certs(path: &str) -> Vec<CertificateDer> {
     CertificateDer::pem_file_iter(path)

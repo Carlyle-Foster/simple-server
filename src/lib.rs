@@ -1,6 +1,8 @@
 #![allow(nonstandard_style)]
 #![allow(unused_braces)]
 
+pub mod helpers;
+
 use std::io;
 use core::str;
 use std::collections::HashMap;
@@ -21,10 +23,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection};
 
 type Handler<'a> = &'a dyn Fn(Request) -> Response;
-
-pub trait From {
-    
-}
 
 pub struct EncryptedStream {
     pub stream: TcpStream,
