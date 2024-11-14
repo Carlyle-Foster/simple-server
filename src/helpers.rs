@@ -1,8 +1,11 @@
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf, Component};
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+use chrono::*;
 
 use crate::*;
 use crate::http::*;
@@ -36,11 +39,23 @@ pub trait IntoResponse {
     fn into_response(self) -> Response;
 }
 
+impl IntoResponse for Status {
+    fn into_response(self) -> Response {
+        Response {
+            version: Version::V_1_1,
+            status: self,
+            headers: vec![],
+            payload: vec![],
+        }
+    }
+}
+
 impl IntoResponse for Vec<u8> {
     fn into_response(self) -> Response {
         Response {
             version: Version::V_1_1,
             status: Status::Ok,
+            headers: vec![],
             payload: self,
         }
     }
@@ -62,17 +77,33 @@ impl IntoResponse for PathBuf {
     }
 }
 
-pub struct VirtualFile<'a, 'b> {
+pub struct VirtualFile<'a, 'b, 'c> {
     pub root: &'a Path,
     pub path: &'b Path,
+    pub request: &'c Request,
 }
 
-impl<'a, 'b> IntoResponse for VirtualFile<'a, 'b> {
+impl<'a, 'b, 'c> IntoResponse for VirtualFile<'a, 'b, 'c> {
     fn into_response(self) -> Response {
         if path_is_sane(self.path) {
             let virtual_path = PathBuf::from(self.root).join(self.path);
             println!("{:#?}", virtual_path);
-            virtual_path.into_response()
+            match self.request.headers.get("if-modified-since") {
+                Some(date) => {
+                    let time: DateTime<Utc>;
+                    match DateTime::parse_from_rfc2822(date) {
+                        Ok(t) => time = t.into(),
+                        Err(_) => panic!("blah"),
+                    };
+                    let last_modified: DateTime<Utc> = fs::metadata(&virtual_path).unwrap().modified().unwrap().into();
+                    match time.cmp(&last_modified) {
+                        Ordering::Less => virtual_path.into_response(),
+                        Ordering::Equal => Status::NotModified.into_response(),
+                        Ordering::Greater => Status::NotModified.into_response(),
+                    }
+                },
+                None => virtual_path.into_response(),
+            }
         }
         else {
             ().into_response()
@@ -85,6 +116,7 @@ impl IntoResponse for () {
         Response {
             version: Version::V_1_1,
             status: Status::NotFound,
+            headers: vec![],
             payload: Vec::new(),
         }
     }

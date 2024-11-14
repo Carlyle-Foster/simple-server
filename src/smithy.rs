@@ -6,7 +6,7 @@ use crate::http::*;
 
 pub trait HttpSmith {
     fn serialize(&self, response: &Response) -> Vec<u8>;
-    fn deserialize<'a>(&self, request: &'a [u8]) -> Option<Request<'a>>;
+    fn deserialize<'a>(&self, request: &'a [u8]) -> Option<Request>;
 }
 
 pub struct HttpSmithText;
@@ -20,16 +20,23 @@ impl HttpSmith for HttpSmithText {
         data.append(&mut response.status.to_status_line().to_owned().into_bytes());
         data.append(&mut "\r\n".to_owned().into_bytes());
 
-        data.append(&mut format!("content-length: {}", response.payload.len()).to_owned().into_bytes());
-        data.append(&mut "\r\n".to_owned().into_bytes());
-        data.append(&mut "Expires: Wed, 21 Oct 2055 07:28:00 GMT".to_owned().into_bytes());
+        // data.append(&mut format!("content-length: {}", response.payload.len()).to_owned().into_bytes());
+        // data.append(&mut "\r\n".to_owned().into_bytes());
+        for header in &response.headers {
+            data.extend_from_slice(header.0.as_bytes());
+            data.push(b':');
+            data.push(b' ');
+            data.extend_from_slice(header.1.as_bytes());
+            data.append(&mut "\r\n".to_owned().into_bytes());
+        }
+        //data.append(&mut "Expires: Wed, 21 Oct 2055 07:28:00 GMT".to_owned().into_bytes());
         data.append(&mut "\r\n\r\n".to_owned().into_bytes());
 
         data.extend_from_slice(&response.payload);
 
         data
     }
-    fn deserialize<'a>(&self, request: &'a [u8]) -> Option<Request<'a>> {
+    fn deserialize<'a>(&self, request: &'a [u8]) -> Option<Request> {
         let text;
         match str::from_utf8(request) {
             Ok(t) => text = t,
@@ -51,7 +58,7 @@ impl HttpSmith for HttpSmithText {
             for header in headers {
                 let (key, value) = header.split_once(":")?;
                 //println!("header key: {}, header value: {}", key, value);
-                request.headers.insert(key, value.trim());
+                request.headers.insert(key.to_lowercase(), value.trim().to_lowercase());
             }
             return Some(request);
         }

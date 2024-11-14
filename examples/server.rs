@@ -26,6 +26,7 @@ fn serve_client_directory() -> impl FnMut(Request) -> Response {
         VirtualFile {
             root: Path::new("client"),
             path: file_path,
+            request: &request,
         }.into_response()
     }
 }

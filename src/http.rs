@@ -1,6 +1,8 @@
 use core::str;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
+use chrono::*;
 
 use crate::helpers::IntoResponse;
 
@@ -41,6 +43,13 @@ impl<'a> HttpServer<'a> {
         if response.status == Status::NotFound {
             response.payload = self.not_found.clone();
         }
+        //format: Sun, 06 Nov 1994 08:49:37 GMT
+        let time: DateTime<Utc> = SystemTime::now().into();
+        let timestamp = time.to_rfc2822();
+        println!("{}", timestamp);
+        response.headers.push(Header("server".to_string(), "simple-server".to_string()));
+        response.headers.push(Header("date".to_string(), timestamp));
+        response.headers.push(Header("content-length".to_string(), format!("{}", response.payload.len())));
         response
     }
 } 
@@ -102,20 +111,21 @@ impl Version {
 }
 
 #[derive(Debug)]
-pub struct Header(String, String);
+pub struct Header(pub String, pub String);
 
 #[derive(Debug)]
-pub struct Request<'event_loop> {
+pub struct Request {
     pub method: Method,
     pub path: PathBuf,
     pub version: Version,
-    pub headers: HashMap<&'event_loop str, &'event_loop str>,
+    pub headers: HashMap<String, String>,
 }
 
 
 pub struct Response {
     pub version: Version,
     pub status: Status,
+    pub headers: Vec<Header>,
     pub payload: Vec<u8>,
 }
 

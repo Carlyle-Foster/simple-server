@@ -9,4 +9,6 @@ edition = "2021"
 
 mio = {version = "1", features = ["os-poll", "net"]}
 
-rustls = {version = "0.23", features = ["logging"]}
+rustls = {version = "0.23"}
+
+chrono = {version = "0.4"}
