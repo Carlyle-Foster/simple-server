@@ -5,6 +5,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::*;
+use crate::http::*;
 
 pub fn get_domain_certs(path: &str) -> Vec<CertificateDer> {
     CertificateDer::pem_file_iter(path)

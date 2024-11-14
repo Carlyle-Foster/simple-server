@@ -1,6 +1,7 @@
 use std::path::Path;
 
-use simple_server::{Method, Request, Response, Server};
+use simple_server::Server;
+use simple_server::http::{Method, Request, Response};
 use simple_server::helpers::{IntoResponse, VirtualFile, get_domain_certs, get_private_key};
 
 fn main() {
