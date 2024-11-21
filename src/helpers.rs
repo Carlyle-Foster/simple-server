@@ -35,89 +35,114 @@ fn path_is_sane(path: &Path) -> bool {
     return sane;
 }
 
-pub trait IntoResponse {
-    fn into_response(self) -> Response;
-}
-
-impl IntoResponse for Status {
-    fn into_response(self) -> Response {
+impl From<Status> for Response {
+    fn from(status: Status) -> Response {
         Response {
             version: Version::V_1_1,
-            status: self,
+            status,
             headers: vec![],
             payload: vec![],
         }
     }
 }
 
-impl IntoResponse for Vec<u8> {
-    fn into_response(self) -> Response {
+impl From<Vec<u8>> for Response {
+    fn from(payload: Vec<u8>) -> Response {
         Response {
             version: Version::V_1_1,
             status: Status::Ok,
             headers: vec![],
-            payload: self,
+            payload,
         }
     }
 }
 
-impl IntoResponse for String {
-    fn into_response(self) -> Response {
-        self.into_bytes().into_response()
+impl From<String> for Response {
+    fn from(payload: String) -> Response {
+        payload.into_bytes().into()
     }
 }
 
-impl IntoResponse for PathBuf {
+impl From<PathBuf> for Response {
     //TODO: proper error handling via HTTP status line
-    fn into_response(self) -> Response {
-        match fs::read(&self){
-            Ok(data) => data.into_response(),
-            Err(_) => ().into_response(),
+    fn from(path: PathBuf) -> Response {
+        match fs::read(&path){
+            Ok(data) => {
+                let mut r: Response = data.into();
+                let timestamp: DateTime<Utc> = fs::metadata(&path).unwrap().modified().unwrap().into();
+                r.headers.push(Header("last-modified-since".to_owned(), timestamp.to_rfc2822()));
+                r
+            },
+            Err(_) => ().into(),
         }
     }
 }
 
-pub struct VirtualFile<'a, 'b, 'c> {
-    pub root: &'a Path,
-    pub path: &'b Path,
-    pub request: &'c Request,
+pub struct VirtualFile {
+    pub root: PathBuf,
+    pub path: PathBuf,
+    pub if_modified_since: Option<DateTime<Utc>>,
 }
 
-impl<'a, 'b, 'c> IntoResponse for VirtualFile<'a, 'b, 'c> {
-    fn into_response(self) -> Response {
-        if path_is_sane(self.path) {
-            let virtual_path = PathBuf::from(self.root).join(self.path);
+impl VirtualFile {
+    pub fn new(root: PathBuf, default: &str, request: Request) -> Self {
+        Self {
+            root,
+            path: 
+                match request.path == Path::new("") {
+                    true => default.into(),
+                    false => request.path,
+                },
+            if_modified_since: 
+                match request.headers.get("if-modified-since") {
+                    Some(date) => {
+                        let date: DateTime<Utc> = DateTime::parse_from_rfc2822(date)
+                            .unwrap()
+                            .into();
+                        Some(date)
+                    },
+                    None => None,
+            },
+        }
+    }
+}
+
+impl From<VirtualFile> for Response {
+    fn from(file: VirtualFile) -> Response {
+        if path_is_sane(&file.path) {
+            let virtual_path = PathBuf::from(file.root).join(file.path);
             println!("{:#?}", virtual_path);
-            match self.request.headers.get("if-modified-since") {
+            match file.if_modified_since {
                 Some(date) => {
-                    let time: DateTime<Utc>;
-                    match DateTime::parse_from_rfc2822(date) {
-                        Ok(t) => time = t.into(),
-                        Err(_) => panic!("blah"),
-                    };
                     let last_modified: DateTime<Utc> = fs::metadata(&virtual_path).unwrap().modified().unwrap().into();
-                    match time.cmp(&last_modified) {
-                        Ordering::Less => virtual_path.into_response(),
-                        Ordering::Equal => Status::NotModified.into_response(),
-                        Ordering::Greater => Status::NotModified.into_response(),
+                    match date.cmp(&last_modified) {
+                        Ordering::Less => virtual_path.into(),
+                        Ordering::Equal => Status::NotModified.into(),
+                        Ordering::Greater => Status::NotModified.into(),
                     }
                 },
-                None => virtual_path.into_response(),
+                None => virtual_path.into(),
             }
         }
         else {
-            ().into_response()
+            ().into()
         }
     }
 }
 
-impl IntoResponse for () {
-    fn into_response(self) -> Response {
+impl From<()> for Response {
+    fn from(_: ()) -> Response {
         Response {
             version: Version::V_1_1,
             status: Status::NotFound,
             headers: vec![],
             payload: Vec::new(),
         }
+    }
+}
+
+impl From<Request> for PathBuf {
+    fn from(r: Request) -> PathBuf {
+        r.path
     }
 }

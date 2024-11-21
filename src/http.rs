@@ -1,42 +1,42 @@
 use core::str;
-use std::collections::HashMap;
+use std::{collections::HashMap, marker::PhantomData};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use chrono::*;
 
-use crate::helpers::IntoResponse;
-
-type Handler = dyn FnMut(Request) -> Response;
-
-pub struct Service<'a> {
+pub struct Service {
     path: PathBuf,
     method: Method,
-    handler: &'a mut Handler,
+    handler: Box<dyn Handle>,
 }
 
-impl<'a> Service<'a> {
-    pub fn new(path_str: &str, method: Method, handler: &'a mut Handler ) -> Self {
+impl Service {
+    pub fn new<I, O>(path_str: &str, method: Method, function: impl FnMut(I) -> O + 'static) -> Self 
+    where
+        I: From<Request> + 'static,
+        O: Into<Response> + 'static,
+    {
         Service {
             path: path_str.parse().unwrap(),
             method,
-            handler,
+            handler: Box::new(Handler::new(function)),
         }
     }
 }
 
-pub struct HttpServer<'a> {
-    pub services: Vec<Service<'a>>,
+pub struct HttpServer {
+    pub services: Vec<Service>,
     pub not_found: Vec<u8>,
 }
 
-impl<'a> HttpServer<'a> {
+impl HttpServer {
     pub fn handle_request(&mut self, mut request: Request) -> Response {
-        let mut response = ().into_response();
+        let mut response = ().into();
         for service in &mut self.services {
             //println!("service path: {:?}, request path: {:?}", service.path, request.path);
             if request.path.starts_with(&service.path) && (request.method == service.method || service.method == Method::ANY) {
                 request.path = request.path.strip_prefix(&service.path).unwrap().to_path_buf();
-                response = (service.handler)(request);
+                response = service.handler.handle(request);
                 break
             }
         }
@@ -47,6 +47,7 @@ impl<'a> HttpServer<'a> {
         let time: DateTime<Utc> = SystemTime::now().into();
         let timestamp = time.to_rfc2822();
         println!("{}", timestamp);
+        println!("{}", response.payload.len());
         response.headers.push(Header("server".to_string(), "simple-server".to_string()));
         response.headers.push(Header("date".to_string(), timestamp));
         response.headers.push(Header("content-length".to_string(), format!("{}", response.payload.len())));
@@ -211,5 +212,38 @@ impl Status {
             Self::NotFound => "404 Not Found",
             _ => "STATUS CODE NOT IMPLEMENTED"
         }
+    }
+}
+
+pub struct Handler<I, O, F>(pub F, PhantomData<I>, PhantomData<O>)
+where
+    I: From<Request>,
+    O: Into<Response>,
+    F: FnMut(I) -> O,
+;
+
+impl<I, O, F> Handler<I, O, F> 
+where
+    I: From<Request>,
+    O: Into<Response>,
+    F: FnMut(I) -> O,
+{
+    pub fn new(function: F) -> Self {
+        Self(function, Default::default(), Default::default())
+    }
+}
+
+pub trait Handle {
+    fn handle(&mut self, r: Request) -> Response;
+}
+
+impl<I, O, F> Handle for Handler<I, O, F>
+where
+    I: From<Request>,
+    O: Into<Response>,
+    F: FnMut(I) -> O,
+{
+    fn handle(&mut self, r: Request) -> Response {
+        (self.0)(I::from(r)).into()
     }
 }

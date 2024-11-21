@@ -30,7 +30,7 @@ impl HttpSmith for HttpSmithText {
             data.append(&mut "\r\n".to_owned().into_bytes());
         }
         //data.append(&mut "Expires: Wed, 21 Oct 2055 07:28:00 GMT".to_owned().into_bytes());
-        data.append(&mut "\r\n\r\n".to_owned().into_bytes());
+        data.append(&mut "\r\n".to_owned().into_bytes());
 
         data.extend_from_slice(&response.payload);
 
