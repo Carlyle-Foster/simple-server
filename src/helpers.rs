@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::fs;
-use std::path::{Path, PathBuf, Component};
 
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -21,15 +21,15 @@ pub fn get_private_key(path: &str) -> PrivateKeyDer<'_> {
     PrivateKeyDer::from_pem_file(path).unwrap()
 }
 
-fn path_is_sane(path: &Path) -> bool {
+pub fn path_is_sane(path: &Utf8Path) -> bool {
     let mut sane = true;
     for segment in path.components() {
         match segment {
-            Component::Prefix(_) => sane = false,
-            Component::RootDir => sane = false,
-            Component::CurDir => continue,
-            Component::ParentDir => sane = false,
-            Component::Normal(_) => continue,
+            Utf8Component::Prefix(_) => sane = false,
+            Utf8Component::RootDir => sane = false,
+            Utf8Component::CurDir => continue,
+            Utf8Component::ParentDir => sane = false,
+            Utf8Component::Normal(_) => continue,
         };
     }
     return sane;
@@ -41,55 +41,52 @@ impl From<Status> for Response {
             version: Version::V_1_1,
             status,
             headers: vec![],
-            payload: vec![],
+            body: "".into(),
         }
     }
 }
 
-impl From<Vec<u8>> for Response {
-    fn from(payload: Vec<u8>) -> Response {
+// impl From<Vec<u8>> for Response {
+//     fn from(payload: Vec<u8>) -> Response {
+//         Response {
+//             version: Version::V_1_1,
+//             status: Status::Ok,
+//             headers: vec![],
+//             body: payload,
+//         }
+//     }
+// }
+
+// impl From<String> for Response {
+//     fn from(payload: String) -> Response {
+//         payload.into_bytes().into()
+//     }
+// }
+
+impl From<Utf8PathBuf> for Response {
+    //TODO: proper error handling via HTTP status line
+    fn from(path: Utf8PathBuf) -> Response {
         Response {
             version: Version::V_1_1,
             status: Status::Ok,
             headers: vec![],
-            payload,
-        }
-    }
-}
-
-impl From<String> for Response {
-    fn from(payload: String) -> Response {
-        payload.into_bytes().into()
-    }
-}
-
-impl From<PathBuf> for Response {
-    //TODO: proper error handling via HTTP status line
-    fn from(path: PathBuf) -> Response {
-        match fs::read(&path){
-            Ok(data) => {
-                let mut r: Response = data.into();
-                let timestamp: DateTime<Utc> = fs::metadata(&path).unwrap().modified().unwrap().into();
-                r.headers.push(Header("last-modified-since".to_owned(), timestamp.to_rfc2822()));
-                r
-            },
-            Err(_) => ().into(),
+            body: path,
         }
     }
 }
 
 pub struct VirtualFile {
-    pub root: PathBuf,
-    pub path: PathBuf,
+    pub root: Utf8PathBuf,
+    pub path: Utf8PathBuf,
     pub if_modified_since: Option<DateTime<Utc>>,
 }
 
 impl VirtualFile {
-    pub fn new(root: PathBuf, default: &str, request: Request) -> Self {
+    pub fn new(root: Utf8PathBuf, default: &str, request: Request) -> Self {
         Self {
             root,
             path: 
-                match request.path == Path::new("") {
+                match request.path == Utf8Path::new("") {
                     true => default.into(),
                     false => request.path,
                 },
@@ -110,7 +107,7 @@ impl VirtualFile {
 impl From<VirtualFile> for Response {
     fn from(file: VirtualFile) -> Response {
         if path_is_sane(&file.path) {
-            let virtual_path = PathBuf::from(file.root).join(file.path);
+            let virtual_path = file.root.join(file.path);
             println!("{:#?}", virtual_path);
             match file.if_modified_since {
                 Some(date) => {
@@ -136,13 +133,60 @@ impl From<()> for Response {
             version: Version::V_1_1,
             status: Status::NotFound,
             headers: vec![],
-            payload: Vec::new(),
+            body: Utf8PathBuf::new(),
         }
     }
 }
 
-impl From<Request> for PathBuf {
-    fn from(r: Request) -> PathBuf {
+impl From<Request> for Utf8PathBuf {
+    fn from(r: Request) -> Utf8PathBuf {
         r.path
+    }
+}
+
+pub trait Read2 {
+    fn read2(&mut self, buffer: &mut [u8]) -> (usize, io::Result<()>);
+}
+
+impl<T: Read> Read2 for T {
+    fn read2(&mut self, buffer: &mut [u8]) -> (usize, io::Result<()>) {
+        let mut bytes_writ = 0;
+        loop {
+            match self.read(&mut buffer[bytes_writ..]) {
+                Ok(0) if buffer.len() == 0 => return (bytes_writ, Ok(())),
+                Ok(0) if buffer.len() != 0 => return (bytes_writ, Err(ErrorKind::ConnectionAborted.into())),
+                Ok(bytes) => {
+                    bytes_writ += bytes;
+                },
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return (bytes_writ, Err(ErrorKind::WouldBlock.into())),
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return (bytes_writ, Err(e)),
+            }
+        };
+    }
+}
+
+pub trait Write2 {
+    fn write2(&mut self, buffer: &[u8]) -> (usize, io::Result<()>);
+    fn flush2(&mut self) -> io::Result<()>;
+}
+
+impl<T: Write> Write2 for T {
+    fn write2(&mut self, buffer: &[u8]) -> (usize, io::Result<()>) {
+        let mut bytes_read = 0;
+        loop {
+            match self.write(&buffer[bytes_read..]) {
+                Ok(0) => return (bytes_read, Ok(())),
+                Ok(bytes) => {
+                    bytes_read += bytes;
+                },
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return (bytes_read, Err(ErrorKind::WouldBlock.into())),
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return (bytes_read, Err(e)),
+            }
+        };
+    }
+    fn flush2(&mut self) -> io::Result<()> {
+        self.flush()
     }
 }

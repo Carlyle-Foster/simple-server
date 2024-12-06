@@ -1,13 +1,16 @@
 use std::net::SocketAddr;
 
+use camino::Utf8PathBuf;
 use simple_server::http::HttpServer;
 use simple_server::http::{Method, Request};
-use simple_server::helpers::{get_domain_certs, get_private_key, VirtualFile};
+use simple_server::helpers::{get_domain_certs, get_private_key};
 
 fn main() {
     let mut server = HttpServer::new();
 
+    server.set_client_directory("client");
     server.add_service("/", Method::GET, serve_client_directory());
+    server.add_homepage("index.html");
     server.add_404_page("client/missing.html");
 
     let domain_cert = get_domain_certs("https_certificates/domain.cert.pem");
@@ -16,9 +19,9 @@ fn main() {
     server.serve(SocketAddr::from(([127, 0, 0, 1], 8783)), domain_cert, private_key);
 }
 
-fn serve_client_directory() -> impl FnMut(Request) -> VirtualFile {
-    move |request: Request| -> VirtualFile {
-        VirtualFile::new("client".into(), "index.html", request)
+fn serve_client_directory() -> impl FnMut(Request) -> Utf8PathBuf {
+    move |request: Request| -> Utf8PathBuf {
+        request.path
     }
 }
 

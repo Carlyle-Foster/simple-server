@@ -1,303 +1,295 @@
 #![allow(nonstandard_style)]
 #![allow(unused_braces)]
+#![allow(unused_parens)]
 
 pub mod http;
 pub mod smithy;
 pub mod helpers;
+pub mod websocket;
+pub mod TLS;
 
-use std::io;
+use std::collections::HashMap;
+use std::io::{self};
 use core::str;
 use std::io::{Write, ErrorKind};
 use std::net::SocketAddr;
 use std::io::Read;
 use std::fs::{self};
 use std::sync::Arc;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
 
-use http::*;
-use smithy::{HttpSmith, HttpSmithText};
+use helpers::{Read2, Write2};
+use mio::event::Event;
+use TLS::TLStream;
 
-use mio::net::{TcpListener, TcpStream};
-use mio::{Poll, Events, Interest, Token};
+use mio::net::TcpListener;
+use mio::{Events, Interest, Poll, Registry, Token};
+#[cfg(target_family = "unix")]
+use mio::unix::SourceFd;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ServerConfig, ServerConnection};
+use rustls::ServerConfig;
 
-const SERVER: Token = Token(!0);
+use camino::{Utf8Path, Utf8PathBuf};
 
-pub struct EncryptedStream {
-    pub stream: TcpStream,
-    pub tls_layer: ServerConnection,
-}
+const STDIN: i32 = 0;
 
-impl EncryptedStream {
-    fn new(stream: TcpStream, config: &Arc<ServerConfig>) -> EncryptedStream {
-        let mut tls_layer =  ServerConnection::new(config.clone()).unwrap();
-        tls_layer.set_buffer_limit(Some(64 * 1024 * 1024));
-        EncryptedStream {
-            stream,
-            tls_layer,
+const SERVER: Token = Token((!0));
+const ADMIN: Token = Token((!0) - 1);
+
+#[derive(Clone)]
+pub struct Vfs(HashMap<Utf8PathBuf, V_file>);
+
+impl Vfs {
+    pub fn get(&mut self, path: &Utf8Path) -> Option<&V_file> {
+        self.check_cache(path);
+        self.0.get(path)
+    }
+
+    pub fn get_mut(&mut self, path: &Utf8Path) -> Option<&mut V_file> {
+        self.check_cache(path);
+        self.0.get_mut(path)
+    }
+
+    fn check_cache(&mut self, path: &Utf8Path) {
+        if !self.0.contains_key(path) {
+            if let Ok(data) = fs::read(path) {
+                self.0.insert(path.into(), V_file { data });
+            }
         }
     }
-}
 
-impl Write for EncryptedStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        //self.tls_layer.complete_io(&mut self.stream)?;
-        let mut writer = self.tls_layer.writer();
-        let bytes = writer.write(buf)?;
-        println!("bytes: {}", bytes);
-        match self.tls_layer.complete_io(&mut self.stream) {
-            Ok(_) => {
-                Ok(bytes)
-            },
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(bytes),
-            Err(e) => Err(e),
+    pub fn get_size(&mut self, path: &Utf8Path) -> Option<usize> {
+        match self.get(path) {
+            Some(file) => Some(file.data.len()),
+            _ => None,
         }
     }
-    fn flush(&mut self) -> io::Result<()> {
-        let mut writer = self.tls_layer.writer();
-        writer.flush()?;
-        self.tls_layer.complete_io(&mut self.stream)?;
+
+    fn write2client(&mut self, connection: &mut Client) -> io::Result<()> {
+        let payload = match self.get(&connection.delivery) {
+            Some(file) => &file.data,
+            None => &Vec::new(),
+        };
+        let mut buffer = &connection.envelope;
+        let mut bytes_writ = buffer.len() + payload.len() - connection.bytes_needed;
+        while connection.bytes_needed > 0 {
+            if (buffer == &connection.envelope) && (bytes_writ >= buffer.len()) {
+                bytes_writ -= buffer.len();
+                buffer = payload;
+            };
+            let (bytes, error) = connection.stream.write2(&buffer[bytes_writ..]);
+            bytes_writ += bytes;
+            connection.bytes_needed -= bytes;
+            match error {
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+                Ok(()) => {},
+            }
+        };
         Ok(())
     }
 }
 
-impl Read for EncryptedStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.tls_layer.complete_io(&mut self.stream) {
-            Ok(_) => {
-                let mut reader = self.tls_layer.reader();
-                reader.read(buf)
-            }
-            Err(e) => Err(e),
-        }
-    }
-}
-
-impl HttpServer {
-    pub fn new() -> Self {
-        Self {
-            services: Vec::with_capacity(4),
-            not_found: Vec::new(),
-        }
-    }
-    pub fn add_service<I, O>(&mut self, path: &str, method: Method, function: impl FnMut(I) -> O + 'static)
-    where
-        I: From<Request> + 'static,
-        O: Into<Response> + 'static,
-    {
-        let service = Service::new(path, method, function);
-        self.services.push(service);
-    }
-    pub fn add_404_page(&mut self, path: &str) {
-        self.not_found = fs::read(path).expect("custom 404 page should exist at the specified path");
-    }
-    pub fn serve(&mut self, address: SocketAddr, domain_cert: Vec<CertificateDer<'static>>, private_key: PrivateKeyDer<'static>) {
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(domain_cert, private_key)
-            .unwrap();
-        
-        println!("serving HTTPS on (https://{}:{})", address.ip(), address.port());
-        self.generic_serve(address, config);
-    }
-    pub fn generic_serve(&mut self, address: SocketAddr, config: ServerConfig) {
-        let mut read_buffer = [0; 4096];
-        let mut io_server = TcpServer::new(address, config);
-        let smith = HttpSmithText{};
-
-        loop {
-            println!("reading now...");
-            match io_server.read(&mut read_buffer) {
-                Ok(0) => { continue },
-                Ok(bytes_read) => {
-                    let start_time = Instant::now();
-                    let data = &read_buffer[..bytes_read];
-                    //print!("{}\r\nRequest Length: {} bytes", request_string, request_string.len());
-                    let request = match smith.deserialize(data) {
-                        Some(request) => request,
-                        None => continue,
-                    };
-                    println!("{:#?}", request);
-                    let response = self.handle_request(request);
-                    println!("writing now...");
-                    match io_server.write(&smith.serialize(&response)) {
-                        Ok(_) => {},
-                        Err(ref e) if e.kind() == ErrorKind::ConnectionAborted => {},
-                        Err(e) => Err(e).unwrap()
-                    }
-                    println!("time: {:?}", start_time.elapsed());
-                },
-                Err(e) => {
-                    Err(e).unwrap()
-                },
-            }
-        }
-    }
+#[derive(Clone)]
+pub struct V_file {
+    data: Vec<u8>,
 }
             
-pub struct TcpServer {
-    poll: Poll,
-    events: Events,
-    connections: clientManifest,
+pub struct TLServer {
     config: Arc<ServerConfig>,
     listener: TcpListener,
-    active_client: Token,
+    poll: Poll,
 }
 
-impl TcpServer {
+impl TLServer {
     pub fn new(address: SocketAddr, config: ServerConfig) -> Self {
         let poll = Poll::new().unwrap();
+        let registry = poll.registry();
         let mut listener = TcpListener::bind(address).unwrap();
 
-        poll.registry()
-            .register(&mut listener, SERVER, Interest::READABLE).unwrap();
+        registry.register(&mut listener, SERVER, Interest::READABLE | Interest::WRITABLE).unwrap();
+        registry.register(&mut SourceFd(&STDIN), ADMIN, Interest::READABLE).unwrap();
 
         Self {
-            poll,
-            events: Events::with_capacity(128),
-            connections: clientManifest::new(128),
             config: Arc::new(config),
             listener,
-            active_client: SERVER,
+            poll,
         }
     }
-    fn poll(&mut self) {
-        match self.poll.poll(&mut self.events, None) {
+
+    fn poll(&mut self, events: &mut Events) {
+        match self.poll.poll(events, None) {
             Ok(_) => {},
             Err(ref e) if e.kind() == ErrorKind::Interrupted => {},
             Err(e) => Err(e).unwrap(),
         }
     }
-} 
 
-impl Read for TcpServer {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize>  {
+    fn serve<'buf>(&mut self, buffer: &'buf mut Vec<u8>, file_system: &mut Vfs, connections: &mut ClientManifest) -> io::Result<(&'buf [u8], Token)> {
+        let mut events: Events = Events::with_capacity(128);
         loop {
-            //println!("new poll");
-            self.poll();
-            for event in self.events.iter() {
-                //println!("{:#?}", event);
+            self.poll(&mut events);
+            for event in events.iter() {
                 match event.token() {
+                    ADMIN => return Ok((&buffer[..0], ADMIN)),
                     SERVER => {
                         match self.listener.accept() {
-                            Ok((mut connection, _)) => {
-                                let token = Token(self.connections.reservation_for_1());
-                                self.poll.registry().register(&mut connection, token, Interest::READABLE | Interest::WRITABLE)?;
-                                self.connections.insert(EncryptedStream::new(connection, &self.config));
+                            Ok((connection, _)) => {
+                                let stream = TLStream::new(connection, self.config.clone());
+                                connections.insert(stream, self.poll.registry())?;
                             }
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
                             e => {
-                                println!("connection refused due to error accepting: {:?}", e);
+                                println!("TCPSERVER: connection refused due to error accepting: {:?}", e);
                             },
                         }
                     }
                     token => {
-                        let connection = match self.connections.get(token) {
-                            Some(client) => client,
-                            None => continue,
-                        };
-                        self.active_client = token;
-                        match connection.read(buffer) {
-                            // Ok(0) => {
-                            //     self.connections.remove(token);
-                            //     println!("read pipe closed");
-                            // }
-                            Ok(bytes_read) => {
-                                println!("read {} bytes", bytes_read);
-                                return Ok(bytes_read)
-                            },
-                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => { println!("{e}"); },
+                        match self.serve_client(buffer, file_system, event, connections) {
+                            Ok(0) => {},
+                            Ok(bytes_read) => return Ok((&buffer[..bytes_read], token)),
                             Err(e) => {
-                                self.connections.remove(token);
-                                println!("client dropped due to error: {:?}", e);
-                            },
-                        }
+                                println!("TCP: dropped client {} on account of error {e}", token.0);
+                                connections.remove(token);
+                            }
+                        };
                     }
                 }
             }
 
         }
     }
+    fn serve_client(&mut self, buffer: &mut Vec<u8>, file_system: &mut Vfs, event: &Event, connections: &mut ClientManifest) -> io::Result<usize> {
+        let token = event.token();
+        if let Some(client) = connections.get(token) {
+            client.check_handshake();
+            if event.is_readable() {
+                let mut bytes_read = 0;
+                loop {
+                    let (bytes, error) = client.stream.read2(&mut buffer[bytes_read..]);
+                    bytes_read += bytes;
+                    match error {
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                        _ => {},
+                    }
+                    if bytes_read >= buffer.len() { buffer.resize(buffer.len() + 4096, 0); }
+                }
+                if bytes_read > 0 {
+                    client.check_handshake();
+                    return Ok(bytes_read);
+                }
+            }
+            if event.is_writable() {
+                if client.bytes_needed > 0 {
+                    match file_system.write2client(client) {
+                        Ok(()) => {},
+                        Err(e) => return Err(e)
+                    }
+                }
+                else {
+                    match client.stream.flush2() {
+                        Ok(()) => {},
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
+                        Err(e) => return Err(e),
+                    } 
+                }
+            }
+            client.check_handshake();
+        }
+        else {
+            println!("TCPSERVER: received invalid ID token {}", token.0);
+        };
+
+        Ok(0)
+    }
+
+    fn dispatch_delivery(&mut self, head: Vec<u8>, body: Utf8PathBuf, file_system: &mut Vfs, connection: &mut Client) -> io::Result<()> {
+        connection.envelope = head;
+        connection.delivery = body;
+        connection.bytes_needed = connection.envelope.len();
+        if let Some(body_size) = file_system.get_size(&connection.delivery) {
+            connection.bytes_needed += body_size;
+        }
+
+        println!("transmitting {:#?} to client {}", connection.delivery, connection.token.0);
+
+        file_system.write2client(connection)
+    }
 }
 
-impl Write for TcpServer {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let connection = match self.connections.get(self.active_client) {
-            Some(client) => client,
-            None => panic!("142658"),
-        };
-        println!("bytes to be written: {}", buffer.len());
-        let mut bytes_written = 0;
-        loop {
-            match connection.write(buffer) {
-                Ok(0) => {
-                    println!("connection closed by client");
-                    self.connections.remove(self.active_client);
-                    return Err(ErrorKind::ConnectionAborted.into());
-                }
-                Ok(bytes) => {
-                    println!("wrote {bytes} bytes");
-                    bytes_written += bytes;
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => { println!("sleeping now"); sleep(Duration::from_millis(1)) },
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    println!("client dropped due to error when writing: {e}");
+#[derive(Debug)]
+pub enum Protocol {
+    HTTP,
+    WEBSOCKET,
+}
 
-                    self.connections.remove(self.active_client);
-                    return Err(ErrorKind::ConnectionAborted.into());
-                },
-            }
-            if bytes_written >= buffer.len() {
-                //println!("wrote {bytes_written} bytes");
-                return Ok(bytes_written)
-            }
+pub struct Client {
+    pub token: Token,
+    pub stream: TLStream,
+    pub envelope: Vec<u8>,
+    pub delivery: Utf8PathBuf,
+    pub bytes_needed: usize,
+    pub was_handshaking: bool,
+    pub protocol: Protocol,
+}
+
+impl Client {
+    fn new(stream: TLStream, token: Token) -> Self {
+        Self {
+            token,
+            stream,
+            envelope: Vec::new(),
+            delivery: "".into(),
+            bytes_needed: 0,
+            was_handshaking: true,
+            protocol: Protocol::HTTP,
         }
     }
-    fn flush(&mut self) -> io::Result<()> {
-        let connection = match self.connections.get(self.active_client) {
-            Some(token) => token,
-            None => panic!("253790"),
+
+    fn check_handshake(&mut self) {
+        let is_handshaking = self.stream.tls.is_handshaking();
+        if self.was_handshaking !=  is_handshaking {
+            println!("CLIENT {}: handshake completed", self.token.0);
+            self.was_handshaking = is_handshaking;
         };
-        connection.flush()
     }
 }
 
-pub struct clientManifest {
-    contents: Vec<Option<EncryptedStream>>,
+pub struct ClientManifest {
+    contents: Vec<Option<Client>>,
     vacancies: Vec<usize>,
 }
 
 //TODO: push panics if the vector grows too large, is this a problem?
-impl clientManifest {
+impl ClientManifest {
     pub fn new(capacity: usize) -> Self {
         Self {
-            contents: Vec::<Option<EncryptedStream>>::with_capacity(capacity),
+            contents: Vec::<Option<Client>>::with_capacity(capacity),
             vacancies: Vec::<usize>::with_capacity(capacity),
         }
     }
-    pub fn reservation_for_1(&mut self) -> usize {
+    pub fn insert(&mut self, stream: TLStream, registry: &Registry) -> io::Result<()> {
+        let vacancy = self.reservation_for_1();
+        let token = Token(vacancy);
+        let mut client = Client::new(stream, token);
+
+        registry.register(&mut client.stream, token, Interest::READABLE | Interest::WRITABLE)?;
+        self.contents[vacancy] = Some(client);
+
+        println!("token = {}", token.0);
+
+        Ok(())
+    }
+    fn reservation_for_1(&mut self) -> usize {
         match self.vacancies.pop() {
             Some(vacancy) => vacancy,
             None => {
-                self.contents.len()
-            },
+                self.contents.push(None);
+                self.contents.len()-1
+            }
         }
     }
-    pub fn insert(&mut self, connection: EncryptedStream) {
-        let c = Some(connection);
-        let vacancy = self.reservation_for_1();
-        if vacancy == self.contents.len() {
-            self.contents.push(c);
-        }
-        else {
-            self.contents[vacancy] = c;
-        }
-    }
-    pub fn get(&mut self, t: Token) -> Option<&mut EncryptedStream> {
+    pub fn get(&mut self, t: Token) -> Option<&mut Client> {
         match self.contents.get_mut(t.0) {
             Some(c) => match c {
                 Some(c) => Some(c),
@@ -307,7 +299,12 @@ impl clientManifest {
         }
     }
     pub fn remove(&mut self, t: Token) {
-        self.contents[t.0] = None;
+        let client = &mut self.contents[t.0];
+        if let Some(client) = client {
+            client.stream.tcp.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        else { panic!("ERROR: attempted to free non-existant client {}", t.0) }
+        *client = None;
         self.vacancies.push(t.0);
     }
 }
