@@ -153,8 +153,8 @@ impl<T: Read> Read2 for T {
         let mut bytes_writ = 0;
         loop {
             match self.read(&mut buffer[bytes_writ..]) {
-                Ok(0) if buffer.len() == 0 => return (bytes_writ, Ok(())),
-                Ok(0) if buffer.len() != 0 => return (bytes_writ, Err(ErrorKind::ConnectionAborted.into())),
+                Ok(0) if  buffer.is_empty() => return (bytes_writ, Ok(())),
+                Ok(0) if !buffer.is_empty() => return (bytes_writ, Err(ErrorKind::ConnectionAborted.into())),
                 Ok(bytes) => {
                     bytes_writ += bytes;
                 },

@@ -1,2 +1,3 @@
 #!/bin/sh
-cargo run --example server
+cargo build --example server
+rlwrap target/debug/examples/server

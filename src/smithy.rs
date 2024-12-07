@@ -40,18 +40,18 @@ impl HttpSmith for HttpSmithText {
         let header = header_from_bytes(bytes)?;
         //println!("{header}");
         let lines: Vec<&str> = header.split("\r\n").collect();
-        let (request_line, headers) = lines.split_at_checked(1).ok_or(EmptyRequest.into())?;
+        let (request_line, headers) = lines.split_at_checked(1).ok_or(EmptyRequest)?;
         let request_line: Vec<&str> = request_line[0].split(' ').collect();
 
         //REF: https://www.rfc-editor.org/rfc/rfc9112.html#section-2.2-7
-        if request_line.len() != 3 { return Err(BadStatusLine.into()); }
+        if request_line.len() != 3 { return Err(BadStatusLine); }
 
-        let method = Method::from_str(request_line[0]).ok_or(BadMethod.into())?;
+        let method = Method::parse(request_line[0]).ok_or(BadMethod)?;
         let (path, query_params) = match request_line[1].split_once('?') {
             Some((path, query)) => (path.into(), parse_query_parameters(query)?),
             None => (request_line[1].into(), HashMap::new()),
         };
-        let version = Version::from_str(request_line[2]).ok_or(UnknownVersion.into())?;
+        let version = Version::parse(request_line[2]).ok_or(UnknownVersion)?;
 
         let mut request = Request{
             method,
@@ -62,17 +62,17 @@ impl HttpSmith for HttpSmithText {
             body: Vec::new(),
         };
         for header in headers {
-            let (key, value) = header.split_once(":").ok_or(MissingColonInHeader.into())?;
+            let (key, value) = header.split_once(":").ok_or(MissingColonInHeader)?;
             let key = key.to_ascii_lowercase();
             let value = value.trim().to_owned();
 
             //REF: https://www.rfc-editor.org/rfc/rfc9112.html#section-5.1-2
-            if key.ends_with(|c: char| c.is_whitespace()) { return Err(WhitespaceBeforeColon.into()) }
+            if key.ends_with(|c: char| c.is_whitespace()) { return Err(WhitespaceBeforeColon) }
             //REF: https://www.rfc-editor.org/rfc/rfc9112.html#section-5.2-4
-            if key.starts_with(|c: char| c.is_whitespace()) { return Err(DeprecatedHeaderFolding.into()) }
+            if key.starts_with(|c: char| c.is_whitespace()) { return Err(DeprecatedHeaderFolding) }
             
             if key == "content-length" {
-                let content_length = value.parse().map_err(|_| ContentLengthNotAnInteger.into() )?;
+                let content_length = value.parse().map_err(|_| ContentLengthNotAnInteger )?;
                 request.body = bytes[header.len()..content_length].to_owned()
             }
             request.headers.insert(key, value);
@@ -86,7 +86,7 @@ fn parse_query_parameters(query: &str) -> Result<HashMap<String, String>, ParseE
 
     let mut map = HashMap::new();
     for param in query.split('&') {
-        let (key, value) = param.split_once('=').ok_or(BadQuery.into())?;
+        let (key, value) = param.split_once('=').ok_or(BadQuery)?;
         println!("QUERY: key = {key}, value = {value}");
         map.insert(key.to_owned(), value.to_owned());
     }

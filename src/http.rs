@@ -5,6 +5,7 @@ use std::{collections::HashMap, marker::PhantomData};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use brotlic::Quality;
 use chrono::*;
 
 use mio::Token;
@@ -59,7 +60,7 @@ impl HttpServer {
             client_directory: Utf8PathBuf::new(),
             homepage: Utf8PathBuf::new(),
             not_found: Utf8PathBuf::new(),
-            file_system: Vfs(HashMap::new()),
+            file_system: Vfs(HashMap::new(), Quality::new(4).unwrap()),
             smith: HttpSmithText{},
         }
     }
@@ -148,17 +149,15 @@ impl HttpServer {
 
     fn COMMAND(&mut self, command: &str) -> Option<()> {
         let parts: Vec<&str> = command.split(|c: char| c.is_whitespace()).filter(|s| !s.is_empty()).collect();
-        let command_word = parts.get(0)?.trim().to_lowercase();
+        let command_word = parts.first()?.trim().to_lowercase();
 
-        println!("");
+        println!();
     
         match command_word.as_ref() {
             "clients" => {
                 println!("Clients:");
-                for entry in &self.connections.contents {
-                    if let Some(client) = entry {
-                        println!("    {}: bytes_needed = {}, delivery = {}, protocol = {:?}", client.token.0, client.bytes_needed, client.delivery, client.protocol);
-                    }
+                for client in self.connections.contents.iter().flatten() {
+                    println!("    {}: bytes_needed = {}, delivery = {}, protocol = {:?}", client.token.0, client.bytes_needed, client.delivery, client.protocol);
                 }
             }
             "kick" => {
@@ -183,6 +182,25 @@ impl HttpServer {
                 println!("Files:");
                 for (path, _file) in self.file_system.0.iter() {
                     println!("    {}", path);
+                }
+            }
+            "quality" => {
+                if let Some(quality) = parts.get(1) {
+                    if let Ok(amount) = quality.parse::<u8>() {
+                        if amount <= 11 {
+                            self.file_system.1 = Quality::new(amount).unwrap();
+                            println!("brotli compression quality set to {}", amount)
+                        }
+                        else {
+                            println!("quality amount must be in the raneg 0-11")
+                        }
+                    }
+                    else {
+                        println!("{} is not a number", quality)
+                    }
+                }
+                else {
+                    println!("quality requires a quality level in the range 0-11, EXAMPLE: quality 10")
                 }
             }
             _ => println!("{command_word} is not a COMMAND, maybe you spelled it wrong?"),
@@ -241,6 +259,7 @@ impl HttpServer {
         response.headers.push(Header("server".to_string(), "simple-server".to_string()));
         response.headers.push(Header("date".to_string(), timestamp));
         response.headers.push(Header("content-length".to_string(), format!("{}", body_size)));
+        response.headers.push(Header("content-encoding".to_string(), "br".to_string()));
         response
     }
 } 
@@ -262,7 +281,7 @@ pub enum Method {
 }
 
 impl Method {
-    pub fn from_str(s: &str) -> Option<Method> {
+    pub fn parse(s: &str) -> Option<Method> {
         //REF: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.1-1
         match s {
             "GET"   => Some(Method::GET),
@@ -282,7 +301,7 @@ pub enum Version {
 
 
 impl Version {
-    pub fn from_str(s: &str) -> Option<Version> {
+    pub fn parse(s: &str) -> Option<Version> {
         //REF: https://www.rfc-editor.org/rfc/rfc9112.html#section-2.3-2
         match s.to_ascii_uppercase().as_ref() {
             "HTTP/1"    => Some(Version::V_1_0),
