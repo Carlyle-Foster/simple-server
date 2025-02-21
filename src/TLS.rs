@@ -1,4 +1,4 @@
-use std::{io::{self, ErrorKind, Write}, sync::Arc};
+use std::{io::{self, ErrorKind}, sync::Arc};
 
 use mio::{event, net::TcpStream};
 use rustls::{ServerConnection, ServerConfig};
@@ -39,10 +39,8 @@ impl Write2 for TLStream {
                 bytes_writ += bytes;
                 tcp_used = true;
             }
-            match error {
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
-                Err(e) => return (bytes_writ, Err(e)),
-                _ => {},
+            if error.is_err() {
+                return (bytes_writ, error);
             }
             if !tcp_used && !tls_used {
                 if self.tls.wants_write() {
@@ -65,8 +63,6 @@ impl Write2 for TLStream {
                 Err(e) => return Err(e),
             };
         };
-        //TODO: is this really necessary?
-        self.tls.writer().flush()?;
         Ok(())
     }
 }
@@ -90,10 +86,8 @@ impl Read2 for TLStream {
             }
             let (bytes, error) = self.tls.reader().read2(&mut buffer[bytes_read..]);
             bytes_read += bytes;
-            match error {
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return (bytes_read, Err(ErrorKind::WouldBlock.into())),
-                Err(e) => return (bytes_read, Err(e)),
-                _ => {},
+            if error.is_err() {
+                return (bytes_read, error);
             }
             if !self.tls.wants_read() { return (bytes_read, Ok(())) }
         }

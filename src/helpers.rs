@@ -46,23 +46,6 @@ impl From<Status> for Response {
     }
 }
 
-// impl From<Vec<u8>> for Response {
-//     fn from(payload: Vec<u8>) -> Response {
-//         Response {
-//             version: Version::V_1_1,
-//             status: Status::Ok,
-//             headers: vec![],
-//             body: payload,
-//         }
-//     }
-// }
-
-// impl From<String> for Response {
-//     fn from(payload: String) -> Response {
-//         payload.into_bytes().into()
-//     }
-// }
-
 impl From<Utf8PathBuf> for Response {
     //TODO: proper error handling via HTTP status line
     fn from(path: Utf8PathBuf) -> Response {
@@ -150,17 +133,17 @@ pub trait Read2 {
 
 impl<T: Read> Read2 for T {
     fn read2(&mut self, buffer: &mut [u8]) -> (usize, io::Result<()>) {
-        let mut bytes_writ = 0;
+        let mut bytes_read = 0;
         loop {
-            match self.read(&mut buffer[bytes_writ..]) {
-                Ok(0) if  buffer.is_empty() => return (bytes_writ, Ok(())),
-                Ok(0) if !buffer.is_empty() => return (bytes_writ, Err(ErrorKind::ConnectionAborted.into())),
+            let buf = &mut buffer[bytes_read..];
+            match self.read(buf) {
+                Ok(0) if  buf.is_empty() => return (bytes_read, Ok(())),
+                Ok(0) if !buf.is_empty() => return (bytes_read, Err(ErrorKind::ConnectionAborted.into())),
                 Ok(bytes) => {
-                    bytes_writ += bytes;
+                    bytes_read += bytes;
                 },
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return (bytes_writ, Err(ErrorKind::WouldBlock.into())),
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return (bytes_writ, Err(e)),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return (bytes_read, Err(e)),
             }
         };
     }
@@ -173,16 +156,15 @@ pub trait Write2 {
 
 impl<T: Write> Write2 for T {
     fn write2(&mut self, buffer: &[u8]) -> (usize, io::Result<()>) {
-        let mut bytes_read = 0;
+        let mut bytes_writ = 0;
         loop {
-            match self.write(&buffer[bytes_read..]) {
-                Ok(0) => return (bytes_read, Ok(())),
+            match self.write(&buffer[bytes_writ..]) {
+                Ok(0) => return (bytes_writ, Ok(())),
                 Ok(bytes) => {
-                    bytes_read += bytes;
+                    bytes_writ += bytes;
                 },
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return (bytes_read, Err(ErrorKind::WouldBlock.into())),
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return (bytes_read, Err(e)),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return (bytes_writ, Err(e)),
             }
         };
     }

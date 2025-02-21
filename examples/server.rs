@@ -1,9 +1,12 @@
 use std::net::SocketAddr;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use camino::Utf8PathBuf;
 use simple_server::http::HttpServer;
 use simple_server::http::{Method, Request};
 use simple_server::helpers::{get_domain_certs, get_private_key};
+use simple_server::websocket::{Message, WebSocket, WebSocketError};
 
 fn main() {
     let mut server = HttpServer::new();
@@ -12,6 +15,7 @@ fn main() {
     server.add_service("/", Method::GET, serve_client_directory());
     server.add_homepage("index.html");
     server.add_404_page("client/missing.html");
+    server.set_websocket_handler(handle_websocket);
 
     let domain_cert = get_domain_certs("https_certificates/domain.cert.pem");
     let private_key = get_private_key("https_certificates/private.key.pem");
@@ -25,17 +29,24 @@ fn serve_client_directory() -> impl FnMut(Request) -> Utf8PathBuf {
     }
 }
 
-// fn serve_static_string() -> impl FnMut(Request) -> String {
-//     let mut upper = false;
-//     let str = "hello world";
-//     move |_: Request| -> String {
-//         upper = !upper;
-//         if upper {
-//             str.to_uppercase()
-//         }
-//         else {
-//             str.to_lowercase()
-//         }
-//     }
-// }
+fn handle_websocket(mut socket: WebSocket) {
+    loop {
+        let start = Instant::now();
+        match socket.read_message() {
+            Ok(message) => {
+                match message {
+                    Message::Binary(_sender, bytes) => {
+                        println!("WEBSOCKET_MESSAGE: {{{:?}}}", bytes)
+                    }
+                    Message::Text(_sender, text) => {
+                        println!("WEBSOCKET_MESSAGE: {text}")
+                    }
+                }
+            },
+            Err(WebSocketError::WOULD_BLOCK) => {},
+            Err(e) => panic!("{e}"),
+        }
+        sleep(Duration::from_millis(33) - start.elapsed());
+    }
+}
 

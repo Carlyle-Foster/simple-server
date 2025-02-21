@@ -38,7 +38,7 @@ const SERVER: Token = Token((!0));
 const ADMIN: Token = Token((!0) - 1);
 
 #[derive(Clone)]
-pub struct Vfs(HashMap<Utf8PathBuf, V_file>, Quality);
+pub struct Vfs(HashMap<Utf8PathBuf, V_file>);
 
 impl Vfs {
     pub fn get(&mut self, path: &Utf8Path) -> Option<&V_file> {
@@ -55,7 +55,7 @@ impl Vfs {
         if !self.0.contains_key(path) {
             if let Ok(data) = fs::read(path) {
                 let precompressed_length = data.len() as f64;
-                let comp_data = compress(&data, self.1);
+                let comp_data = compress(&data);
                 println!("Compression Ratio: {:.2}", comp_data.len() as f64 / precompressed_length);
                 self.0.insert(path.into(), V_file { data: comp_data });
             }
@@ -87,6 +87,10 @@ impl Vfs {
                 Ok(()) => {},
             }
         };
+        //TODO: this is very hacky, i'm using Unsupported to signal that the websocket handshake is complete
+        if connection.protocol == Protocol::WEBSOCKET && connection.bytes_needed == 0 {
+            return Err(ErrorKind::Unsupported.into());
+        }
         Ok(())
     }
 }
@@ -137,7 +141,7 @@ impl TLServer {
                         match self.listener.accept() {
                             Ok((connection, _)) => {
                                 let stream = TLStream::new(connection, self.config.clone());
-                                connections.insert(stream, self.poll.registry())?;
+                                connections.insert(stream, Protocol::HTTP, self.poll.registry())?;
                             }
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
                             e => {
@@ -146,9 +150,10 @@ impl TLServer {
                         }
                     }
                     token => {
-                        match self.serve_client(buffer, file_system, event, connections) {
+                        match serve_client(buffer, file_system, event, connections) {
                             Ok(0) => {},
                             Ok(bytes_read) => return Ok((&buffer[..bytes_read], token)),
+                            Err(e) if e.kind() == ErrorKind::Unsupported => return Ok((&buffer[..0], token)),
                             Err(e) => {
                                 println!("TCP: dropped client {} on account of error {e}", token.0);
                                 connections.remove(token);
@@ -159,50 +164,6 @@ impl TLServer {
             }
 
         }
-    }
-    fn serve_client(&mut self, buffer: &mut Vec<u8>, file_system: &mut Vfs, event: &Event, connections: &mut ClientManifest) -> io::Result<usize> {
-        let token = event.token();
-        if let Some(client) = connections.get(token) {
-            client.check_handshake();
-            if event.is_readable() {
-                let mut bytes_read = 0;
-                loop {
-                    let (bytes, error) = client.stream.read2(&mut buffer[bytes_read..]);
-                    bytes_read += bytes;
-                    match error {
-                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Err(e) => return Err(e),
-                        _ => {},
-                    }
-                    if bytes_read >= buffer.len() { buffer.resize(buffer.len() + 4096, 0); }
-                }
-                if bytes_read > 0 {
-                    client.check_handshake();
-                    return Ok(bytes_read);
-                }
-            }
-            if event.is_writable() {
-                if client.bytes_needed > 0 {
-                    match file_system.write2client(client) {
-                        Ok(()) => {},
-                        Err(e) => return Err(e)
-                    }
-                }
-                else {
-                    match client.stream.flush2() {
-                        Ok(()) => {},
-                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
-                        Err(e) => return Err(e),
-                    } 
-                }
-            }
-            client.check_handshake();
-        }
-        else {
-            println!("TCPSERVER: received invalid ID token {}", token.0);
-        };
-
-        Ok(0)
     }
 
     fn dispatch_delivery(&mut self, head: Vec<u8>, body: Utf8PathBuf, file_system: &mut Vfs, connection: &mut Client) -> io::Result<()> {
@@ -219,7 +180,53 @@ impl TLServer {
     }
 }
 
+fn serve_client(buffer: &mut Vec<u8>, file_system: &mut Vfs, event: &Event, connections: &mut ClientManifest) -> io::Result<usize> {
+    let token = event.token();
+    if let Some(client) = connections.get(token) {
+        client.check_handshake();
+        if event.is_readable() {
+            let mut bytes_read = 0;
+            loop {
+                let (bytes, error) = client.stream.read2(&mut buffer[bytes_read..]);
+                bytes_read += bytes;
+                match error {
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                    _ => {},
+                }
+                if bytes_read >= buffer.len() { buffer.resize(buffer.len() + 4096, 0); }
+            }
+            if bytes_read > 0 {
+                client.check_handshake();
+                return Ok(bytes_read);
+            }
+        }
+        if event.is_writable() {
+            if client.bytes_needed > 0 {
+                match file_system.write2client(client) {
+                    Ok(()) => {},
+                    Err(e) => return Err(e)
+                }
+            }
+            else {
+                match client.stream.flush2() {
+                    Ok(()) => {},
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
+                    Err(e) => return Err(e),
+                } 
+            }
+        }
+        client.check_handshake();
+    }
+    else {
+        println!("TCPSERVER: received invalid ID token {}", token.0);
+    };
+
+    Ok(0)
+}
+
 #[derive(Debug)]
+#[derive(PartialEq)]
 pub enum Protocol {
     HTTP,
     WEBSOCKET,
@@ -236,7 +243,7 @@ pub struct Client {
 }
 
 impl Client {
-    fn new(stream: TLStream, token: Token) -> Self {
+    fn new(stream: TLStream, token: Token, protocol: Protocol) -> Self {
         Self {
             token,
             stream,
@@ -244,7 +251,7 @@ impl Client {
             delivery: "".into(),
             bytes_needed: 0,
             was_handshaking: true,
-            protocol: Protocol::HTTP,
+            protocol,
         }
     }
 
@@ -270,10 +277,10 @@ impl ClientManifest {
             vacancies: Vec::<usize>::with_capacity(capacity),
         }
     }
-    pub fn insert(&mut self, stream: TLStream, registry: &Registry) -> io::Result<()> {
+    pub fn insert(&mut self, stream: TLStream, protocol: Protocol, registry: &Registry) -> io::Result<()> {
         let vacancy = self.reservation_for_1();
         let token = Token(vacancy);
-        let mut client = Client::new(stream, token);
+        let mut client = Client::new(stream, token, protocol);
 
         registry.register(&mut client.stream, token, Interest::READABLE | Interest::WRITABLE)?;
         self.contents[vacancy] = Some(client);
@@ -281,6 +288,16 @@ impl ClientManifest {
         println!("token = {}", token.0);
 
         Ok(())
+    }
+    pub fn take(&mut self, t: Token, registry: &Registry) -> Option<TLStream> {
+        match self.contents.get_mut(t.0) {
+            Some(entry) => {
+                let mut client = entry.take()?;
+                registry.deregister(&mut client.stream).unwrap();
+                Some(client.stream)
+            }
+            None => None,
+        }
     }
     fn reservation_for_1(&mut self) -> usize {
         match self.vacancies.pop() {
@@ -311,11 +328,11 @@ impl ClientManifest {
     }
 }
 
-pub fn compress(data: &[u8], quality: Quality) -> Vec<u8> {
+pub fn compress(data: &[u8]) -> Vec<u8> {
     let output = Vec::with_capacity(data.len());
 
     let encoder = BrotliEncoderOptions::new()
-    .quality(quality)
+    .quality(Quality::new(4).unwrap())
     .build().unwrap();
 
     let mut compressor = brotlic::CompressorWriter::with_encoder(encoder, output);

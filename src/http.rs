@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::{collections::HashMap, marker::PhantomData};
 use std::path::PathBuf;
 use std::time::SystemTime;
+use std::sync::mpsc;
 
-use brotlic::Quality;
 use chrono::*;
 
 use mio::Token;
@@ -17,7 +17,8 @@ use camino::Utf8PathBuf;
 
 use crate::helpers::path_is_sane;
 use crate::smithy::{HttpSmith, HttpSmithText};
-use crate::websocket::compute_sec_websocket_accept;
+use crate::websocket::{compute_sec_websocket_accept, WebSocket};
+use crate::TLS::TLStream;
 use crate::{ClientManifest, Protocol, TLServer, Vfs, ADMIN};
 
 
@@ -50,6 +51,7 @@ pub struct HttpServer {
     pub not_found: Utf8PathBuf,
     pub file_system: Vfs,
     pub smith: HttpSmithText,
+    pub websocket: Option<mpsc::Sender<TLStream>>,
 }
 
 impl HttpServer {
@@ -60,8 +62,9 @@ impl HttpServer {
             client_directory: Utf8PathBuf::new(),
             homepage: Utf8PathBuf::new(),
             not_found: Utf8PathBuf::new(),
-            file_system: Vfs(HashMap::new(), Quality::new(4).unwrap()),
+            file_system: Vfs(HashMap::new()),
             smith: HttpSmithText{},
+            websocket: None,
         }
     }
     pub fn add_service<I, O>(&mut self, path: &str, method: Method, function: impl FnMut(I) -> O + 'static)
@@ -77,6 +80,12 @@ impl HttpServer {
     }
     pub fn add_404_page(&mut self, path: &str) {
         self.not_found = path.into();
+    }
+    pub fn set_websocket_handler(&mut self, mut handler: impl FnMut(WebSocket) + 'static + std::marker::Send) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let websocket = WebSocket::new(receiver);
+        self.websocket = Some(sender);
+        std::thread::spawn(move || { handler(websocket) });
     }
     pub fn set_client_directory(&mut self, path: &str) {
         self.client_directory = path.into();
@@ -105,18 +114,28 @@ impl HttpServer {
                         self.COMMAND(&command);
                         continue
                     }
+                    //a zero-length buffer signals the completion of a websocket handshake
+                    if request.is_empty() {
+                        self.sendoff_websocket(token, &tls_server);
+                    }
                     match self.connections.get(token).unwrap().protocol {
                         Protocol::HTTP => {
                             self.serve_http(token, request, &mut tls_server);
                         },
-                        Protocol::WEBSOCKET => {
-                            
-                        }
+                        Protocol::WEBSOCKET => unreachable!(),
                     }
                 },
                 Err(e) => panic!("HTTPSERVER_CRASHED (on account of {e})"),
             }
         };
+    }
+
+    fn sendoff_websocket(&mut self, token: Token, tls_server: &TLServer) {
+        if self.connections.get(token).unwrap().bytes_needed == 0 {
+            let client = self.connections.take(token, tls_server.poll.registry()).unwrap();
+            self.websocket.as_mut().unwrap().send(client).unwrap();
+        }
+        println!("we did it");
     }
 
     fn serve_http(&mut self, token: Token, request: &[u8], tls_server: &mut TLServer) {
@@ -130,7 +149,9 @@ impl HttpServer {
                 }
                 match tls_server.dispatch_delivery(head, body, &mut self.file_system, client) {
                     Ok(_) => {},
-                    Err(ref e) if e.kind() == ErrorKind::ConnectionAborted => {
+                    //this is so stupid but it's not like Unsupported is otherwise returnable, so... 
+                    Err(e) if e.kind() == ErrorKind::Unsupported => self.sendoff_websocket(token, tls_server),
+                    Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
                         println!("HTTPSERVER: client {} disconnected (discovered when we tried writing to them)", token.0);
                         self.connections.remove(token);
                     },
@@ -184,25 +205,6 @@ impl HttpServer {
                     println!("    {}", path);
                 }
             }
-            "quality" => {
-                if let Some(quality) = parts.get(1) {
-                    if let Ok(amount) = quality.parse::<u8>() {
-                        if amount <= 11 {
-                            self.file_system.1 = Quality::new(amount).unwrap();
-                            println!("brotli compression quality set to {}", amount)
-                        }
-                        else {
-                            println!("quality amount must be in the raneg 0-11")
-                        }
-                    }
-                    else {
-                        println!("{} is not a number", quality)
-                    }
-                }
-                else {
-                    println!("quality requires a quality level in the range 0-11, EXAMPLE: quality 10")
-                }
-            }
             _ => println!("{command_word} is not a COMMAND, maybe you spelled it wrong?"),
         };
         Some(())
@@ -220,12 +222,11 @@ impl HttpServer {
         if let Some(key) = request.headers.get("sec-websocket-key") {
             println!("websockets!!, {:#?}", key);
             let mut response: Response = Status::SwitchingProtocols.into();
-            response.headers.push(Header("connection".to_string(), "upgrade".to_string()));
-            response.headers.push(Header("upgrade".to_string(), "websocket".to_string()));
-            //response.headers.push(Header("sec-websocket-version".to_string(), "13".to_string()));
-            //response.headers.push(Header("sec-websocket-protocol".to_string(), "chat".to_string()));
-            response.headers.push(Header("sec-websocket-accept".to_string(), compute_sec_websocket_accept(key)));
-            //response.headers.push(Header("content-length".to_string(), "0".to_string()));
+            response.add_header("connection", "upgrade");
+            response.add_header("upgrade", "websocket");
+            response.add_header("sec-websocket-version", "13");
+            response.add_header("sec-websocket-accept", &compute_sec_websocket_accept(key));
+            response.add_header("content-length", "0");
             return response;
         }
         let mut response = ().into();
@@ -251,15 +252,15 @@ impl HttpServer {
         if dropped {
             response.status = Status::NotFound;
             response.body = self.not_found.clone();
-            body_size = self.file_system.get_size(&self.not_found).unwrap()
+            body_size = self.file_system.get_size(&self.not_found).unwrap_or(0)
         }
         //format: Sun, 06 Nov 1994 08:49:37 GMT
         let time: DateTime<Utc> = SystemTime::now().into();
         let timestamp = time.to_rfc2822();
-        response.headers.push(Header("server".to_string(), "simple-server".to_string()));
-        response.headers.push(Header("date".to_string(), timestamp));
-        response.headers.push(Header("content-length".to_string(), format!("{}", body_size)));
-        response.headers.push(Header("content-encoding".to_string(), "br".to_string()));
+        response.add_header("server", "simple-server");
+        response.add_header("date", &timestamp);
+        response.add_header("content-length", &format!("{}", body_size));
+        response.add_header("content-encoding", "br");
         response
     }
 } 
@@ -322,7 +323,7 @@ impl Version {
 }
 
 #[derive(Debug)]
-pub struct Header(pub String, pub String);
+pub struct Header(pub &'static str, pub String);
 
 #[derive(Debug)]
 pub struct Request {
@@ -334,12 +335,17 @@ pub struct Request {
     pub body: Vec<u8>,
 }
 
-
 pub struct Response {
     pub version: Version,
     pub status: Status,
     pub headers: Vec<Header>,
     pub body: Utf8PathBuf,
+}
+
+impl Response {
+    pub fn add_header(&mut self, key: &'static str, value: &str) {
+        self.headers.push(Header(key, value.to_owned()))
+    }
 }
 
 #[repr(i16)]
