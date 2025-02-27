@@ -2,10 +2,11 @@ use core::{fmt, str};
 use std::{collections::HashMap, error::Error, sync::mpsc::{Receiver, TryRecvError}, time::Duration};
 
 use mio::Token;
+use rustls::client;
 use sha1::{Digest, Sha1};
 use base64::prelude::*;
 
-use crate::{serve_client, ClientManifest, Protocol, Vfs, TLS::TLStream};
+use crate::{helpers::Write2, serve_client, ClientManifest, Protocol, Vfs, TLS::TLStream};
 
 pub fn compute_sec_websocket_accept(key: &str) -> String {
     let mut sha1 = Sha1::new();
@@ -54,7 +55,7 @@ impl WebSocket {
         for event in &self.queue {
             match serve_client(&mut self.buffer, &mut Vfs(HashMap::new()), event, &mut self.clients) {
                 Ok(0) => {},
-                Ok(bytes_read) => return self.parse_message(bytes_read),
+                Ok(bytes_read) => return self.parse_message(event.token(), bytes_read),
                 Err(e) => {
                     println!("WEBSOCKET: dropped client {} on account of error {e}", event.token().0);
                     self.clients.remove(event.token());
@@ -63,7 +64,13 @@ impl WebSocket {
         };
         Err(WOULD_BLOCK)
     }
-    fn parse_message(&mut self, bytes_read: usize) -> Result<Message, WebSocketError> {
+    pub fn send_binary(&mut self, message: &[u8], client: Token) -> Result<(), WebSocketError> {
+        self.write_message(Message::Binary(client, message.to_owned()))
+    }
+    pub fn send_text(&mut self, message: &str, client: Token) -> Result<(), WebSocketError> {
+        self.write_message(Message::Text(client, message.to_owned()))
+    }
+    fn parse_message(&mut self, client: Token, bytes_read: usize) -> Result<Message, WebSocketError> {
         use OPCODE::*;
         use WebSocketError::*;
         loop {
@@ -82,13 +89,13 @@ impl WebSocket {
                 }
                 Text => {
                     if self.incoming_message.is_some() { return Err(CUTTING_IN) }
-                    self.incoming_message = Some(Message::Text(Token(100), frame.unmask_into_text(String::with_capacity(256))?));
+                    self.incoming_message = Some(Message::Text(client, frame.unmask_into_text(String::with_capacity(256))?));
                     if frame.fin { return Ok(self.incoming_message.take().unwrap()); }
                     else { continue }
                 },
                 Binary => {
                     if self.incoming_message.is_some() { return Err(CUTTING_IN) }
-                    self.incoming_message = Some(Message::Binary(Token(100), frame.unmask_into_binary(Vec::with_capacity(256))));
+                    self.incoming_message = Some(Message::Binary(client, frame.unmask_into_binary(Vec::with_capacity(256))));
                     if frame.fin { return Ok(self.incoming_message.take().unwrap()); }
                     else { continue }
                 }
@@ -103,7 +110,7 @@ impl WebSocket {
 
         if data.len() < (1 + 1 + 4) { return Err(TOO_SHORT) }
     
-        let fin = ((data[0] >> 7) & 0b1) > 0;
+        let fin = (data[0] >> 7) > 0;
         if ((data[0] >> 4) & 0b111) != 0 { return Err(UNRESERVED) }
         let opcode = OPCODE::parse(data[0] & 0b1111)?;
         if ((data[1] >> 7) & 0b1) == 0 { return Err(UNMASKED) }
@@ -131,13 +138,45 @@ impl WebSocket {
         let frame = Frame {
             fin,
             opcode,
-            mask_key,
+            mask_key: Some(mask_key),
             payload,
         };
     
         println!("Frame: fin = {}, opcode = {:?}", frame.fin, frame.opcode);
     
         Ok(frame)
+    }
+    fn write_message(&mut self, msg: Message) -> Result<(), WebSocketError> {
+        let frame = msg.to_frame();
+        assert!(frame.payload.len() < 126);
+        let mut buf = Vec::<u8>::with_capacity(126 + 2);
+        buf.push((1 << 7) | (frame.opcode as u8));
+
+        const limit1: usize = 126;
+        const limit2: usize = 1 << 16;
+        let len = frame.payload.len();
+        match len {
+            0..limit1 => buf.push(len as u8),
+            limit1..limit2 => {
+                buf.push(126);
+                buf.append(&mut (len as u16).to_be_bytes().to_vec());
+            }
+            limit2.. => {
+                buf.push(127);
+                buf.append(&mut (len as u64).to_be_bytes().to_vec());
+            }
+        }
+        buf.append(&mut frame.payload.to_owned());
+        if let Some(client) = self.clients.get(msg.get_client()) {
+            let mut bytes = 0;
+            while bytes < buf.len() {
+                let (bytes_writ, err) = client.stream.write2(&buf[bytes..]);
+                if let Err(e) = err { panic!("{e}")};
+                println!("WEBSOCKET: wrote {} bytes to client {}", bytes_writ, client.token.0);
+                bytes += bytes_writ;
+            }
+        } else { panic!("{:?}", msg.get_client()) }
+        Ok(())
     }
     
 }
@@ -195,27 +234,35 @@ impl OPCODE {
 struct Frame<'buf> {
     pub fin: bool,
     pub opcode: OPCODE,
-    pub mask_key: [u8;4],
+    pub mask_key: Option<[u8;4]>,
     pub payload: &'buf [u8],
 }
 
 impl<'buf> Frame<'buf> {
     pub fn unmask_into_binary(&self, mut buffer: Vec<u8>) -> Vec<u8> {
         assert!(buffer.len() <= self.payload.len());
-        for (index, byte)  in self.payload.iter().enumerate() {
-            buffer.push(byte ^ self.mask_key[index % 4])
+
+        if let Some(mask_key) = self.mask_key {
+            for (index, byte)  in self.payload.iter().enumerate() {
+                buffer.push(byte ^ mask_key[index % 4])
+            }
+        } else {
+            buffer.append(&mut self.payload.to_owned());
         }
         buffer
     }
     pub fn unmask_into_text(&self, buffer: String) -> Result<String, WebSocketError> {
-        assert!(buffer.len() <= self.payload.len());
-
         use WebSocketError::*;
+        assert!(buffer.len() <= self.payload.len());
 
         let mut buffer = buffer.into_bytes();
         let initial_length = buffer.len();
-        for (index, byte)  in self.payload.iter().enumerate() {
-            buffer.push(byte ^ self.mask_key[index % 4])
+        if let Some(mask_key) = self.mask_key {
+            for (index, byte)  in self.payload.iter().enumerate() {
+                buffer.push(byte ^ mask_key[index % 4])
+            }
+        } else {
+            buffer.append(&mut self.payload.to_owned());
         }
         let _ = str::from_utf8(&buffer[initial_length..]).map_err(|_e| EXPECTED_UTF8)?;
         return Ok( unsafe {String::from_utf8_unchecked(buffer)} )
@@ -225,4 +272,29 @@ impl<'buf> Frame<'buf> {
 pub enum Message {
     Text(Token, String),
     Binary(Token, Vec<u8>),
+}
+
+impl Message {
+    fn to_frame(&self) -> Frame {
+        match self {
+            Message::Binary(_, contents) => Frame {
+                fin: true,
+                opcode: OPCODE::Binary,
+                mask_key: None,
+                payload: contents,
+            },
+            Message::Text(_, contents) => Frame { 
+                fin: true, 
+                opcode: OPCODE::Text, 
+                mask_key: None, 
+                payload: contents.as_bytes(),
+            }
+        }
+    }
+    fn get_client(&self) -> Token {
+        match self {
+            Message::Binary(client, _) => *client,
+            Message::Text(client, _) => *client,
+        }
+    }
 }

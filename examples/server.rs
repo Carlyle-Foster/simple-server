@@ -35,11 +35,13 @@ fn handle_websocket(mut socket: WebSocket) {
         match socket.read_message() {
             Ok(message) => {
                 match message {
-                    Message::Binary(_sender, bytes) => {
-                        println!("WEBSOCKET_MESSAGE: {{{:?}}}", bytes)
+                    Message::Binary(sender, bytes) => {
+                        println!("WEBSOCKET_MESSAGE_BINARY: {{{:?}}}", bytes);
+                        socket.send_binary(&bytes, sender).unwrap();
                     }
-                    Message::Text(_sender, text) => {
-                        println!("WEBSOCKET_MESSAGE: {text}")
+                    Message::Text(sender, text) => {
+                        println!("WEBSOCKET_MESSAGE_TEXT: {text}");
+                        socket.send_text(&text, sender).unwrap();
                     }
                 }
             },
