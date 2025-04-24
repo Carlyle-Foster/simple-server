@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 
-mio = {version = "1.0.2", features = ["os-poll", "net", "os-ext"]}
+mio = {version = "1.0.3", features = ["os-poll", "net", "os-ext"]}
 
 rustls = {version = "0.23"}
 
