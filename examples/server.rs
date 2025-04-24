@@ -13,8 +13,8 @@ fn main() {
 
     server.set_client_directory("client");
     server.add_service("/", Method::GET, serve_client_directory());
-    server.add_homepage("index.html");
-    server.add_404_page("client/missing.html");
+    server.set_homepage("index.html");
+    server.set_404_page("client/missing.html");
     server.set_websocket_handler(handle_websocket);
 
     let domain_cert = get_domain_certs("https_certificates/domain.cert.pem");

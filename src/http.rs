@@ -1,5 +1,5 @@
 use core::str;
-use std::io::{stdin, ErrorKind, Read};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::{collections::HashMap, marker::PhantomData};
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ use crate::helpers::path_is_sane;
 use crate::smithy::{HttpSmith, HttpSmithText};
 use crate::websocket::{compute_sec_websocket_accept, WebSocket};
 use crate::TLS::TLStream;
-use crate::{ClientManifest, Protocol, TLServer, Vfs, ADMIN};
+use crate::{ClientManifest, Protocol, TLServer, Vfs};
 
 
 pub struct Service {
@@ -75,10 +75,10 @@ impl HttpServer {
         let service = Service::new(path, method, function);
         self.services.push(service);
     }
-    pub fn add_homepage(&mut self, path: &str) {
+    pub fn set_homepage(&mut self, path: &str) {
         self.homepage = path.into();
     }
-    pub fn add_404_page(&mut self, path: &str) {
+    pub fn set_404_page(&mut self, path: &str) {
         self.not_found = path.into();
     }
     pub fn set_websocket_handler(&mut self, mut handler: impl FnMut(WebSocket) + 'static + std::marker::Send) {
@@ -95,34 +95,24 @@ impl HttpServer {
             .with_no_client_auth()
             .with_single_cert(domain_cert, private_key)
             .unwrap();
-        
-        println!("HTTPSERVER: serving on (https://{}:{})", address.ip(), address.port());
-        self.generic_serve(address, config);
-    }
-    pub fn generic_serve(&mut self, address: SocketAddr, config: ServerConfig) {
-        let mut buffer = Vec::with_capacity(4096);
         let mut tls_server = TLServer::new(address, config);
-        let mut command_buffer = [0; 4096];
-        
+        let mut buffer = Vec::with_capacity(4096);
+
+        println!("HTTPSERVER: serving on (https://{}:{})", address.ip(), address.port());
+
         loop {
             match tls_server.serve(&mut buffer, &mut self.file_system, &mut self.connections) {
                 Ok((request, token)) => {
-                    if token == ADMIN {
-                        let bytes_read = stdin().read(&mut command_buffer).unwrap();
-                        let command = String::from_utf8_lossy(&command_buffer[..bytes_read]);
-                        
-                        self.COMMAND(&command);
-                        continue
-                    }
                     //a zero-length buffer signals the completion of a websocket handshake
                     if request.is_empty() {
                         self.sendoff_websocket(token, &tls_server);
-                    }
-                    match self.connections.get(token).unwrap().protocol {
-                        Protocol::HTTP => {
-                            self.serve_http(token, request, &mut tls_server);
-                        },
-                        Protocol::WEBSOCKET => unreachable!(),
+                    } else {
+                        match self.connections.get(token).unwrap().protocol {
+                            Protocol::HTTP => {
+                                self.serve_http(token, request, &mut tls_server);
+                            },
+                            Protocol::WEBSOCKET => unreachable!(),
+                        }
                     }
                 },
                 Err(e) => panic!("HTTPSERVER_CRASHED (on account of {e})"),
@@ -166,48 +156,6 @@ impl HttpServer {
                 self.connections.remove(token);
             },
         }
-    }
-
-    fn COMMAND(&mut self, command: &str) -> Option<()> {
-        let parts: Vec<&str> = command.split(|c: char| c.is_whitespace()).filter(|s| !s.is_empty()).collect();
-        let command_word = parts.first()?.trim().to_lowercase();
-
-        println!();
-    
-        match command_word.as_ref() {
-            "clients" => {
-                println!("Clients:");
-                for client in self.connections.contents.iter().flatten() {
-                    println!("    {}: bytes_needed = {}, delivery = {}, protocol = {:?}", client.token.0, client.bytes_needed, client.delivery, client.protocol);
-                }
-            }
-            "kick" => {
-                if let Some(client) = parts.get(1) {
-                    if let Ok(id) = client.parse::<usize>() {
-                        let token = Token(id);
-                        if self.connections.get(token).is_none() { println!("client {id} does not exist"); }
-                        else {
-                            self.connections.remove(Token(id));
-                            println!("SUCCESS: curbstomped client {id}");
-                        }
-                    }
-                    else {
-                        println!("kick couldn't parse that client ID (the ID in question: {client})");
-                    }
-                }
-                else {
-                    println!("kick requires a client ID, EXAMPLE: kick 3");
-                }
-            }
-            "files" => {
-                println!("Files:");
-                for (path, _file) in self.file_system.0.iter() {
-                    println!("    {}", path);
-                }
-            }
-            _ => println!("{command_word} is not a COMMAND, maybe you spelled it wrong?"),
-        };
-        Some(())
     }
 }
 
@@ -260,7 +208,6 @@ impl HttpServer {
         response.add_header("server", "simple-server");
         response.add_header("date", &timestamp);
         response.add_header("content-length", &format!("{}", body_size));
-        response.add_header("content-encoding", "br");
         response
     }
 } 

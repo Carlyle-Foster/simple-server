@@ -2,7 +2,6 @@ use core::{fmt, str};
 use std::{collections::HashMap, error::Error, sync::mpsc::{Receiver, TryRecvError}, time::Duration};
 
 use mio::Token;
-use rustls::client;
 use sha1::{Digest, Sha1};
 use base64::prelude::*;
 
@@ -238,7 +237,7 @@ struct Frame<'buf> {
     pub payload: &'buf [u8],
 }
 
-impl<'buf> Frame<'buf> {
+impl Frame<'_> {
     pub fn unmask_into_binary(&self, mut buffer: Vec<u8>) -> Vec<u8> {
         assert!(buffer.len() <= self.payload.len());
 

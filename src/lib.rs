@@ -16,26 +16,19 @@ use std::net::SocketAddr;
 use std::io::Read;
 use std::fs::{self};
 use std::sync::Arc;
-use std::time::Instant;
 
-use brotlic::{BrotliEncoderOptions, Quality};
 use helpers::{Read2, Write2};
 use mio::event::Event;
 use TLS::TLStream;
 
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Registry, Token};
-#[cfg(target_family = "unix")]
-use mio::unix::SourceFd;
 
 use rustls::ServerConfig;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
-const STDIN: i32 = 0;
-
 const SERVER: Token = Token((!0));
-const ADMIN: Token = Token((!0) - 1);
 
 #[derive(Clone)]
 pub struct Vfs(HashMap<Utf8PathBuf, V_file>);
@@ -54,10 +47,7 @@ impl Vfs {
     fn check_cache(&mut self, path: &Utf8Path) {
         if !self.0.contains_key(path) {
             if let Ok(data) = fs::read(path) {
-                let precompressed_length = data.len() as f64;
-                let comp_data = compress(&data);
-                println!("Compression Ratio: {:.2}", comp_data.len() as f64 / precompressed_length);
-                self.0.insert(path.into(), V_file { data: comp_data });
+                self.0.insert(path.into(), V_file { data });
             }
         }
     }
@@ -113,7 +103,6 @@ impl TLServer {
         let mut listener = TcpListener::bind(address).unwrap();
 
         registry.register(&mut listener, SERVER, Interest::READABLE | Interest::WRITABLE).unwrap();
-        registry.register(&mut SourceFd(&STDIN), ADMIN, Interest::READABLE).unwrap();
 
         Self {
             config: Arc::new(config),
@@ -136,15 +125,14 @@ impl TLServer {
             self.poll(&mut events);
             for event in events.iter() {
                 match event.token() {
-                    ADMIN => return Ok((&buffer[..0], ADMIN)),
                     SERVER => {
                         match self.listener.accept() {
                             Ok((connection, _)) => {
                                 let stream = TLStream::new(connection, self.config.clone());
                                 connections.insert(stream, Protocol::HTTP, self.poll.registry())?;
                             }
-                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
-                            e => {
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                            Err(e) => {
                                 println!("TCPSERVER: connection refused due to error accepting: {:?}", e);
                             },
                         }
@@ -327,18 +315,3 @@ impl ClientManifest {
         self.vacancies.push(t.0);
     }
 }
-
-pub fn compress(data: &[u8]) -> Vec<u8> {
-    let output = Vec::with_capacity(data.len());
-
-    let encoder = BrotliEncoderOptions::new()
-    .quality(Quality::new(4).unwrap())
-    .build().unwrap();
-
-    let mut compressor = brotlic::CompressorWriter::with_encoder(encoder, output);
-    let start = Instant::now();
-    compressor.write_all(data).unwrap();
-    println!("TIME_TO_COMPRESS: {:?}", start.elapsed());
-    compressor.into_inner().unwrap()
-}
-
