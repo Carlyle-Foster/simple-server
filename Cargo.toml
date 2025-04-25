@@ -18,9 +18,11 @@ chrono = {version = "0.4"}
 sha1 = {version = "0.10.6"}
 
 base64 = {version = "0.22"}
+fastrand = "2.3.0"
 
 [lints.clippy]
 needless_return = "allow"
 collapsible_match = "allow"
 double_parens = "allow"
 upper_case_acronyms = "allow"
+unnecessary_to_owned = "allow"

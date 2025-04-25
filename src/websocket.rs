@@ -20,7 +20,6 @@ pub struct WebSocket {
     queue: mio::Events,
     poll: mio::Poll,
     clients: ClientManifest,
-    buffer: Vec<u8>,
 }
 
 impl WebSocket {
@@ -31,14 +30,13 @@ impl WebSocket {
             queue: mio::Events::with_capacity(128),
             poll: mio::Poll::new().unwrap(),
             clients: ClientManifest::new(128),
-            buffer: Vec::with_capacity(1024),
         }
     }
     fn welcome_new_clients(&mut self) {
         loop {
             match self.receiver.try_recv() {
                 Ok(stream) => {
-                    println!("added 1 client");
+                    println!("WEBSOCKETS: added 1 client");
                     self.clients.insert(stream, Protocol::WEBSOCKET, self.poll.registry()).unwrap();
                 },
                 Err(TryRecvError::Empty) => break,
@@ -46,56 +44,74 @@ impl WebSocket {
             }
         }
     }
-    pub fn read_message(&mut self) -> Result<Message, WebSocketError> {
+    pub fn read_message(&mut self) -> Result<(Token, Message), WebSocketError> {
         use WebSocketError::*;
 
         self.welcome_new_clients();
         self.poll.poll(&mut self.queue, Some(Duration::ZERO)).unwrap();
-        for event in &self.queue {
-            match serve_client(&mut self.buffer, &mut Vfs(HashMap::new()), event, &mut self.clients) {
+        for event in self.queue.iter().cloned() {
+            let client_id = event.token();
+            match serve_client(&mut Vfs(HashMap::new()), &event, &mut self.clients) {
                 Ok(0) => {},
-                Ok(bytes_read) => return self.parse_message(event.token(), bytes_read),
+                Ok(_) => {
+                    let message = self.parse_message(client_id)?;
+                    let client = self.clients.get(client_id).unwrap();
+                    client.buffer.clear();
+                    return Ok((client_id, message));
+                },
                 Err(e) => {
-                    println!("WEBSOCKET: dropped client {} on account of error {e}", event.token().0);
-                    self.clients.remove(event.token());
+                    println!("WEBSOCKET: dropped client {} on account of error {e}", client_id.0);
+                    self.clients.remove(client_id);
                 }
             };
         };
         Err(WOULD_BLOCK)
     }
     pub fn send_binary(&mut self, message: &[u8], client: Token) -> Result<(), WebSocketError> {
-        self.write_message(Message::Binary(client, message.to_owned()))
+        self.write_message(Message::Binary(message.to_owned()), client)
     }
     pub fn send_text(&mut self, message: &str, client: Token) -> Result<(), WebSocketError> {
-        self.write_message(Message::Text(client, message.to_owned()))
+        self.write_message(Message::Text(message.to_owned()), client)
     }
-    fn parse_message(&mut self, client: Token, bytes_read: usize) -> Result<Message, WebSocketError> {
+    fn parse_message(&mut self, client: Token) -> Result<Message, WebSocketError> {
         use OPCODE::*;
         use WebSocketError::*;
+        let client = self.clients.get(client).unwrap();
+        let mut buf = &client.buffer[..];
         loop {
-            let frame = Self::read_frame(self, &self.buffer[..bytes_read])?;
+            let (frame, rest) = Self::read_frame(buf)?;
+            buf = rest;
             match frame.opcode {
                 Continuation => {
                     if let Some(message) = self.incoming_message.take() {
                         self.incoming_message = match message {
-                            Message::Text(s, t) => Message::Text(s, frame.unmask_into_text(t)?),
-                            Message::Binary(s, b) => Message::Binary(s, frame.unmask_into_binary(b)),
+                            Message::Text(t) => Message::Text(frame.unmask_into_text(t)?),
+                            Message::Binary(b) => Message::Binary(frame.unmask_into_binary(b)),
                         }.into();
-                        if frame.fin { return Ok(self.incoming_message.take().unwrap()); }
+                        if frame.fin { 
+                            client.buffer.clear();
+                            return Ok(self.incoming_message.take().unwrap()); 
+                        }
                         else { continue }
                     }
                     else { return Err(BAD_CONTINUE) }
                 }
                 Text => {
                     if self.incoming_message.is_some() { return Err(CUTTING_IN) }
-                    self.incoming_message = Some(Message::Text(client, frame.unmask_into_text(String::with_capacity(256))?));
-                    if frame.fin { return Ok(self.incoming_message.take().unwrap()); }
+                    self.incoming_message = Some(Message::Text(frame.unmask_into_text(String::with_capacity(256))?));
+                    if frame.fin { 
+                        client.buffer.clear();
+                        return Ok(self.incoming_message.take().unwrap()); 
+                    }
                     else { continue }
                 },
                 Binary => {
                     if self.incoming_message.is_some() { return Err(CUTTING_IN) }
-                    self.incoming_message = Some(Message::Binary(client, frame.unmask_into_binary(Vec::with_capacity(256))));
-                    if frame.fin { return Ok(self.incoming_message.take().unwrap()); }
+                    self.incoming_message = Some(Message::Binary(frame.unmask_into_binary(Vec::with_capacity(256))));
+                    if frame.fin { 
+                        client.buffer.clear();
+                        return Ok(self.incoming_message.take().unwrap()); 
+                    }
                     else { continue }
                 }
                 Close => { return Err(UNIMPLEMENTED) },
@@ -104,7 +120,7 @@ impl WebSocket {
             }
         }
     }
-    fn read_frame<'a>(&self, data: &'a [u8]) -> Result<Frame<'a>, WebSocketError> {
+    fn read_frame(data: &[u8]) -> Result<(Frame, &[u8]), WebSocketError> {
         use WebSocketError::*;
 
         if data.len() < (1 + 1 + 4) { return Err(TOO_SHORT) }
@@ -114,7 +130,7 @@ impl WebSocket {
         let opcode = OPCODE::parse(data[0] & 0b1111)?;
         if ((data[1] >> 7) & 0b1) == 0 { return Err(UNMASKED) }
         let mask_key_offset: usize;
-        match (data[1] & 0b1111111) {
+        let payload_len = match (data[1] & 0b01111111) {
             l if l < 126 => {
                 mask_key_offset = 2;
                 l as u64
@@ -122,7 +138,7 @@ impl WebSocket {
             126 => {
                 mask_key_offset = 4;
                 if data.len() < 8 { return Err(TOO_SHORT) }
-                u16::from_be_bytes(data[2..3].try_into().unwrap()) as u64
+                u16::from_be_bytes(data[2..4].try_into().unwrap()) as u64
             },
             127 => {
                 mask_key_offset = 10;
@@ -133,6 +149,8 @@ impl WebSocket {
         };
         let mask_key: [u8;4] = data[mask_key_offset..mask_key_offset+4].try_into().unwrap();
         let payload = &data[mask_key_offset+4..];
+        println!("PAYLOAD_LENGTH = {payload_len}, ACTUAL_LENGTH = {}", payload.len());
+        let (payload, rest) = payload.split_at_checked(payload_len as usize).ok_or(WOULD_BLOCK)?;
     
         let frame = Frame {
             fin,
@@ -143,17 +161,16 @@ impl WebSocket {
     
         println!("Frame: fin = {}, opcode = {:?}", frame.fin, frame.opcode);
     
-        Ok(frame)
+        Ok((frame, rest))
     }
-    fn write_message(&mut self, msg: Message) -> Result<(), WebSocketError> {
+    fn write_message(&mut self, msg: Message, client: Token) -> Result<(), WebSocketError> {
         let frame = msg.to_frame();
-        assert!(frame.payload.len() < 126);
-        let mut buf = Vec::<u8>::with_capacity(126 + 2);
+        let len = frame.payload.len();
+        let mut buf = Vec::<u8>::with_capacity(len + 2);
         buf.push((1 << 7) | (frame.opcode as u8));
 
         const limit1: usize = 126;
         const limit2: usize = 1 << 16;
-        let len = frame.payload.len();
         match len {
             0..limit1 => buf.push(len as u8),
             limit1..limit2 => {
@@ -166,7 +183,7 @@ impl WebSocket {
             }
         }
         buf.append(&mut frame.payload.to_owned());
-        if let Some(client) = self.clients.get(msg.get_client()) {
+        if let Some(client) = self.clients.get(client) {
             let mut bytes = 0;
             while bytes < buf.len() {
                 let (bytes_writ, err) = client.stream.write2(&buf[bytes..]);
@@ -174,13 +191,14 @@ impl WebSocket {
                 println!("WEBSOCKET: wrote {} bytes to client {}", bytes_writ, client.token.0);
                 bytes += bytes_writ;
             }
-        } else { panic!("{:?}", msg.get_client()) }
+        } else { panic!("WebSocket::write_message: invalid client ID {:?}", client.0) }
         Ok(())
     }
     
 }
 
 #[derive(Debug)]
+#[derive(PartialEq)]
 pub enum WebSocketError {
     TOO_SHORT,
     UNRESERVED,
@@ -269,31 +287,25 @@ impl Frame<'_> {
 }
 
 pub enum Message {
-    Text(Token, String),
-    Binary(Token, Vec<u8>),
+    Text(String),
+    Binary(Vec<u8>),
 }
 
 impl Message {
     fn to_frame(&self) -> Frame {
         match self {
-            Message::Binary(_, contents) => Frame {
+            Message::Binary(contents) => Frame {
                 fin: true,
                 opcode: OPCODE::Binary,
                 mask_key: None,
                 payload: contents,
             },
-            Message::Text(_, contents) => Frame { 
+            Message::Text(contents) => Frame { 
                 fin: true, 
                 opcode: OPCODE::Text, 
                 mask_key: None, 
                 payload: contents.as_bytes(),
             }
-        }
-    }
-    fn get_client(&self) -> Token {
-        match self {
-            Message::Binary(client, _) => *client,
-            Message::Text(client, _) => *client,
         }
     }
 }

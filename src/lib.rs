@@ -119,7 +119,7 @@ impl TLServer {
         }
     }
 
-    fn serve<'buf>(&mut self, buffer: &'buf mut Vec<u8>, file_system: &mut Vfs, connections: &mut ClientManifest) -> io::Result<(&'buf [u8], Token)> {
+    fn serve<'buf>(&mut self, file_system: &mut Vfs, connections: &'buf mut ClientManifest) -> io::Result<(&'buf [u8], Token)> {
         let mut events: Events = Events::with_capacity(128);
         loop {
             self.poll(&mut events);
@@ -138,10 +138,16 @@ impl TLServer {
                         }
                     }
                     token => {
-                        match serve_client(buffer, file_system, event, connections) {
+                        match serve_client(file_system, event, connections) {
                             Ok(0) => {},
-                            Ok(bytes_read) => return Ok((&buffer[..bytes_read], token)),
-                            Err(e) if e.kind() == ErrorKind::Unsupported => return Ok((&buffer[..0], token)),
+                            Ok(_) => {
+                                let client = connections.get(event.token()).unwrap();
+                                return Ok((&client.buffer[..], token))
+                            },
+                            Err(e) if e.kind() == ErrorKind::Unsupported => {
+                                let client = connections.get(event.token()).unwrap();
+                                return Ok((&client.buffer[..0], token))
+                            },
                             Err(e) => {
                                 println!("TCP: dropped client {} on account of error {e}", token.0);
                                 connections.remove(token);
@@ -162,17 +168,19 @@ impl TLServer {
             connection.bytes_needed += body_size;
         }
 
-        println!("transmitting {:#?} to client {}", connection.delivery, connection.token.0);
+        println!("transmitting {:#?} of size {} to client {}", connection.delivery, connection.bytes_needed, connection.token.0);
 
         file_system.write2client(connection)
     }
 }
 
-fn serve_client(buffer: &mut Vec<u8>, file_system: &mut Vfs, event: &Event, connections: &mut ClientManifest) -> io::Result<usize> {
+fn serve_client(file_system: &mut Vfs, event: &Event, connections: &mut ClientManifest) -> io::Result<usize> {
     let token = event.token();
     if let Some(client) = connections.get(token) {
         client.check_handshake();
+        let buffer = &mut client.buffer;
         if event.is_readable() {
+            println!("buffer.len() = {}", buffer.len());
             let mut bytes_read = 0;
             loop {
                 let (bytes, error) = client.stream.read2(&mut buffer[bytes_read..]);
@@ -214,6 +222,7 @@ fn serve_client(buffer: &mut Vec<u8>, file_system: &mut Vfs, event: &Event, conn
 }
 
 #[derive(Debug)]
+#[derive(Clone, Copy)]
 #[derive(PartialEq)]
 pub enum Protocol {
     HTTP,
@@ -226,6 +235,7 @@ pub struct Client {
     pub envelope: Vec<u8>,
     pub delivery: Utf8PathBuf,
     pub bytes_needed: usize,
+    pub buffer: Vec<u8>,
     pub was_handshaking: bool,
     pub protocol: Protocol,
 }
@@ -238,6 +248,7 @@ impl Client {
             envelope: Vec::new(),
             delivery: "".into(),
             bytes_needed: 0,
+            buffer: vec![],
             was_handshaking: true,
             protocol,
         }
@@ -246,7 +257,7 @@ impl Client {
     fn check_handshake(&mut self) {
         let is_handshaking = self.stream.tls.is_handshaking();
         if self.was_handshaking !=  is_handshaking {
-            println!("CLIENT {}: handshake completed", self.token.0);
+            println!("CLIENT {}: SSL handshake completed", self.token.0);
             self.was_handshaking = is_handshaking;
         };
     }
@@ -273,7 +284,7 @@ impl ClientManifest {
         registry.register(&mut client.stream, token, Interest::READABLE | Interest::WRITABLE)?;
         self.contents[vacancy] = Some(client);
 
-        println!("token = {}", token.0);
+        println!("ClientManifest::insert: ID = {}, protocol = {:?}", token.0, protocol);
 
         Ok(())
     }

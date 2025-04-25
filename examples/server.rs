@@ -35,20 +35,22 @@ fn handle_websocket(mut socket: WebSocket) {
         match socket.read_message() {
             Ok(message) => {
                 match message {
-                    Message::Binary(sender, bytes) => {
+                    (client, Message::Binary(bytes)) => {
                         println!("WEBSOCKET_MESSAGE_BINARY: {{{:?}}}", bytes);
-                        socket.send_binary(&bytes, sender).unwrap();
+                        socket.send_binary(&bytes, client).unwrap();
                     }
-                    Message::Text(sender, text) => {
+                    (client, Message::Text(text)) => {
                         println!("WEBSOCKET_MESSAGE_TEXT: {text}");
-                        socket.send_text(&text, sender).unwrap();
+                        println!("WEBSOCKET_MESSAGE_LENGTH: {}", text.len());
+                        socket.send_text(&text, client).unwrap();
                     }
                 }
             },
             Err(WebSocketError::WOULD_BLOCK) => {},
             Err(e) => panic!("{e}"),
         }
-        sleep(Duration::from_millis(33) - start.elapsed());
+        let sleepy_time = Duration::from_millis(10).checked_sub(start.elapsed()).unwrap_or(Duration::from_millis(1));
+        sleep(sleepy_time);
     }
 }
 

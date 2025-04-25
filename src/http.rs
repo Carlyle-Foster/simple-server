@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use std::sync::mpsc;
 
-use chrono::*;
+use chrono::{DateTime, Utc};
 
 use mio::Token;
 
@@ -16,7 +16,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use camino::Utf8PathBuf;
 
 use crate::helpers::path_is_sane;
-use crate::smithy::{HttpSmith, HttpSmithText};
+use crate::smithy::{HttpSmith, HttpSmithText, ParseError};
 use crate::websocket::{compute_sec_websocket_accept, WebSocket};
 use crate::TLS::TLStream;
 use crate::{ClientManifest, Protocol, TLServer, Vfs};
@@ -96,23 +96,19 @@ impl HttpServer {
             .with_single_cert(domain_cert, private_key)
             .unwrap();
         let mut tls_server = TLServer::new(address, config);
-        let mut buffer = Vec::with_capacity(4096);
 
         println!("HTTPSERVER: serving on (https://{}:{})", address.ip(), address.port());
 
         loop {
-            match tls_server.serve(&mut buffer, &mut self.file_system, &mut self.connections) {
+            match tls_server.serve(&mut self.file_system, &mut self.connections) {
                 Ok((request, token)) => {
                     //a zero-length buffer signals the completion of a websocket handshake
                     if request.is_empty() {
                         self.sendoff_websocket(token, &tls_server);
                     } else {
-                        match self.connections.get(token).unwrap().protocol {
-                            Protocol::HTTP => {
-                                self.serve_http(token, request, &mut tls_server);
-                            },
-                            Protocol::WEBSOCKET => unreachable!(),
-                        }
+                        let client = self.connections.get(token).unwrap();
+                        let rq = client.buffer.clone(); // this is stupid!!!
+                        self.serve_http(token, &rq, &mut tls_server);
                     }
                 },
                 Err(e) => panic!("HTTPSERVER_CRASHED (on account of {e})"),
@@ -123,20 +119,28 @@ impl HttpServer {
     fn sendoff_websocket(&mut self, token: Token, tls_server: &TLServer) {
         if self.connections.get(token).unwrap().bytes_needed == 0 {
             let client = self.connections.take(token, tls_server.poll.registry()).unwrap();
-            self.websocket.as_mut().unwrap().send(client).unwrap();
+            let _ = self.websocket.as_mut().unwrap().send(client);
+            println!("sendoff_websocket: client {} sent off", token.0);
         }
-        println!("we did it");
     }
 
     fn serve_http(&mut self, token: Token, request: &[u8], tls_server: &mut TLServer) {
         match self.smith.deserialize(request) {
-            Ok(request) => {
+            Ok((request, bytes)) => {
                 let response = self.handle_request(request);
                 let (head, body) = self.smith.serialize(&response);
+
                 let client = self.connections.get(token).unwrap();
+                client.buffer.clear(); // TODO: make this a ring buffer?
+                assert!(client.protocol != Protocol::WEBSOCKET);
                 if response.status == Status::SwitchingProtocols {
                     client.protocol = Protocol::WEBSOCKET;
                 }
+
+                if !bytes.is_empty() {
+                    println!("DEBUG: dropped {} bytes!!!", bytes.len());
+                }
+
                 match tls_server.dispatch_delivery(head, body, &mut self.file_system, client) {
                     Ok(_) => {},
                     //this is so stupid but it's not like Unsupported is otherwise returnable, so... 
@@ -151,6 +155,10 @@ impl HttpServer {
                     },
                 };
             },
+            Err(ParseError::Incomplete) => {
+                let client = self.connections.get(token).unwrap();
+                client.buffer.extend_from_slice(request);
+            }
             Err(e) => {
                 println!("HTTPSERVER: client {} dropped on account of bad request, Message Parsing error: {{{e}}}", token.0);
                 self.connections.remove(token);
@@ -168,7 +176,6 @@ impl Default for HttpServer {
 impl HttpServer {
     pub fn handle_request(&mut self, mut request: Request) -> Response {
         if let Some(key) = request.headers.get("sec-websocket-key") {
-            println!("websockets!!, {:#?}", key);
             let mut response: Response = Status::SwitchingProtocols.into();
             response.add_header("connection", "upgrade");
             response.add_header("upgrade", "websocket");
