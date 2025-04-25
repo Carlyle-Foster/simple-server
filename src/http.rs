@@ -8,8 +8,6 @@ use std::sync::mpsc;
 
 use chrono::{DateTime, Utc};
 
-use mio::Token;
-
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -17,9 +15,10 @@ use camino::Utf8PathBuf;
 
 use crate::helpers::path_is_sane;
 use crate::smithy::{HttpSmith, HttpSmithText, ParseError};
-use crate::websocket::{compute_sec_websocket_accept, WebSocket};
+// use crate::websocket::{compute_sec_websocket_accept, WebSocket};
 use crate::TLS::TLStream;
-use crate::{ClientManifest, Protocol, TLServer, Vfs};
+use crate::TLS2::{ServerEvent, TLServer2};
+use crate::{Client, Protocol, Vfs};
 
 
 pub struct Service {
@@ -45,7 +44,7 @@ impl Service {
 
 pub struct HttpServer {
     pub services: Vec<Service>,
-    pub connections: ClientManifest,
+    pub clients: HashMap<u64, Client>,
     pub client_directory: Utf8PathBuf,
     pub homepage: Utf8PathBuf,
     pub not_found: Utf8PathBuf,
@@ -58,7 +57,7 @@ impl HttpServer {
     pub fn new() -> Self {
         Self {
             services: Vec::with_capacity(4),
-            connections: ClientManifest::new(128),
+            clients: HashMap::with_capacity(128),
             client_directory: Utf8PathBuf::new(),
             homepage: Utf8PathBuf::new(),
             not_found: Utf8PathBuf::new(),
@@ -81,12 +80,12 @@ impl HttpServer {
     pub fn set_404_page(&mut self, path: &str) {
         self.not_found = path.into();
     }
-    pub fn set_websocket_handler(&mut self, mut handler: impl FnMut(WebSocket) + 'static + std::marker::Send) {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let websocket = WebSocket::new(receiver);
-        self.websocket = Some(sender);
-        std::thread::spawn(move || { handler(websocket) });
-    }
+    // pub fn set_websocket_handler(&mut self, mut handler: impl FnMut(WebSocket) + 'static + std::marker::Send) {
+    //     let (sender, receiver) = std::sync::mpsc::channel();
+    //     let websocket = WebSocket::new(receiver);
+    //     self.websocket = Some(sender);
+    //     std::thread::spawn(move || { handler(websocket) });
+    // }
     pub fn set_client_directory(&mut self, path: &str) {
         self.client_directory = path.into();
     }
@@ -95,76 +94,116 @@ impl HttpServer {
             .with_no_client_auth()
             .with_single_cert(domain_cert, private_key)
             .unwrap();
-        let mut tls_server = TLServer::new(address, config);
+        let mut tls_server = TLServer2::new(address, config);
 
         println!("HTTPSERVER: serving on (https://{}:{})", address.ip(), address.port());
 
         loop {
-            match tls_server.serve(&mut self.file_system, &mut self.connections) {
-                Ok((request, token)) => {
-                    //a zero-length buffer signals the completion of a websocket handshake
-                    if request.is_empty() {
-                        self.sendoff_websocket(token, &tls_server);
-                    } else {
-                        let client = self.connections.get(token).unwrap();
-                        let rq = client.buffer.clone(); // this is stupid!!!
-                        self.serve_http(token, &rq, &mut tls_server);
-                    }
+            let (id, event) = tls_server.serve().unwrap_or_else(|e| panic!("HTTPSERVER_CRASHED (on account of {e})"));
+            match event {
+                ServerEvent::CLIENT_JOINED => {
+                    let newcomer = Client::new(id, Protocol::HTTP);
+                    self.clients.insert(id, newcomer);
                 },
-                Err(e) => panic!("HTTPSERVER_CRASHED (on account of {e})"),
+                ServerEvent::CLIENT_READABLE => {
+                    let client = self.clients.get_mut(&id).unwrap();
+                    let (bytes_read, err) = tls_server.read_from_client(id, &mut client.buffer);
+                    match err {
+                        Ok(()) => {},
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                        Err(e) => {
+                            tls_server.drop_client(id);
+                            self.clients.remove(&id).unwrap();
+                            println!("HTTP_SERVER: dropped client on account of error when reading: {e}");
+                            continue
+                        }
+                    };
+                    match self.smith.deserialize(&client.buffer[..bytes_read as usize]) {
+                        Ok((request, rest)) => {
+                            let response = self.handle_request(request);
+                            let (header, body_path) = self.smith.serialize(&response);
+                            client.bytes_needed = header.len() + self.file_system.get_size(&body_path).unwrap();
+                            client.envelope = header;
+                            client.delivery = body_path;
+                        },
+                        Err(ParseError::Incomplete) => println!("HTTP_SERVER: received request fragment"),
+                        Err(e) => {
+                            tls_server.drop_client(id);
+                            self.clients.remove(&id).unwrap();
+                            println!("HTTP_SERVER: dropped client on account of error when parsing request: {e}");
+                        }
+
+                    }
+                    todo!("try and interpret the HTTP message")
+                },
+                ServerEvent::CLIENT_WRITABLE => {
+                    let client = self.clients.get_mut(&id).unwrap();
+                    match self.file_system.write2client(client, &mut tls_server) {
+                        Ok(()) => {},
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                        Err(e) => {
+                            tls_server.drop_client(id);
+                            self.clients.remove(&id).unwrap();
+                            println!("HTTP_SERVER: dropped client on account of error when writing: {e}");
+                        }
+                    };
+                },
+                ServerEvent::CLIENT_LEFT => {
+                    self.clients.remove(&id).unwrap();
+                },
             }
         };
     }
 
-    fn sendoff_websocket(&mut self, token: Token, tls_server: &TLServer) {
-        if self.connections.get(token).unwrap().bytes_needed == 0 {
-            let client = self.connections.take(token, tls_server.poll.registry()).unwrap();
-            let _ = self.websocket.as_mut().unwrap().send(client);
-            println!("sendoff_websocket: client {} sent off", token.0);
-        }
-    }
+    // fn sendoff_websocket(&mut self, token: Token, tls_server: &TLServer) {
+    //     if self.connections.get(token).unwrap().bytes_needed == 0 {
+    //         let client = self.connections.take(token, tls_server.poll.registry()).unwrap();
+    //         let _ = self.websocket.as_mut().unwrap().send(client);
+    //         println!("sendoff_websocket: client {} sent off", token.0);
+    //     }
+    // }
 
-    fn serve_http(&mut self, token: Token, request: &[u8], tls_server: &mut TLServer) {
-        match self.smith.deserialize(request) {
-            Ok((request, bytes)) => {
-                let response = self.handle_request(request);
-                let (head, body) = self.smith.serialize(&response);
+    // fn serve_http(&mut self, id: u64, request: &[u8], tls_server: &mut TLServer) {
+    //     match self.smith.deserialize(request) {
+    //         Ok((request, bytes)) => {
+    //             let response = self.handle_request(request);
+    //             let (head, body) = self.smith.serialize(&response);
 
-                let client = self.connections.get(token).unwrap();
-                client.buffer.clear(); // TODO: make this a ring buffer?
-                assert!(client.protocol != Protocol::WEBSOCKET);
-                if response.status == Status::SwitchingProtocols {
-                    client.protocol = Protocol::WEBSOCKET;
-                }
+    //             let client = self.clients.get(&id).unwrap();
+    //             client.buffer.clear(); // TODO: make this a ring buffer?
+    //             assert!(client.protocol != Protocol::WEBSOCKET);
+    //             if response.status == Status::SwitchingProtocols {
+    //                 client.protocol = Protocol::WEBSOCKET;
+    //             }
 
-                if !bytes.is_empty() {
-                    println!("DEBUG: dropped {} bytes!!!", bytes.len());
-                }
+    //             if !bytes.is_empty() {
+    //                 println!("DEBUG: dropped {} bytes!!!", bytes.len());
+    //             }
 
-                match tls_server.dispatch_delivery(head, body, &mut self.file_system, client) {
-                    Ok(_) => {},
-                    //this is so stupid but it's not like Unsupported is otherwise returnable, so... 
-                    Err(e) if e.kind() == ErrorKind::Unsupported => self.sendoff_websocket(token, tls_server),
-                    Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
-                        println!("HTTPSERVER: client {} disconnected (discovered when we tried writing to them)", token.0);
-                        self.connections.remove(token);
-                    },
-                    Err(e) => {
-                        println!("HTTPSERVER: client {} dropped on account of IO error: {{{e}}}", token.0);
-                        self.connections.remove(token);
-                    },
-                };
-            },
-            Err(ParseError::Incomplete) => {
-                let client = self.connections.get(token).unwrap();
-                client.buffer.extend_from_slice(request);
-            }
-            Err(e) => {
-                println!("HTTPSERVER: client {} dropped on account of bad request, Message Parsing error: {{{e}}}", token.0);
-                self.connections.remove(token);
-            },
-        }
-    }
+    //             match tls_server.dispatch_delivery(head, body, &mut self.file_system, client) {
+    //                 Ok(_) => {},
+    //                 //this is so stupid but it's not like Unsupported is otherwise returnable, so... 
+    //                 Err(e) if e.kind() == ErrorKind::Unsupported => unimplemented!(), //self.sendoff_websocket(token, tls_server),
+    //                 Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
+    //                     println!("HTTPSERVER: client {} disconnected (discovered when we tried writing to them)", id);
+    //                     self.clients.remove(&id);
+    //                 },
+    //                 Err(e) => {
+    //                     println!("HTTPSERVER: client {} dropped on account of IO error: {{{e}}}", id);
+    //                     self.clients.remove(&id);
+    //                 },
+    //             };
+    //         },
+    //         Err(ParseError::Incomplete) => {
+    //             let client = self.clients.get(&id).unwrap();
+    //             client.buffer.extend_from_slice(request);
+    //         }
+    //         Err(e) => {
+    //             println!("HTTPSERVER: client {} dropped on account of bad request, Message Parsing error: {{{e}}}", id);
+    //             self.clients.remove(&id);
+    //         },
+    //     }
+    // }
 }
 
 impl Default for HttpServer {
@@ -175,15 +214,15 @@ impl Default for HttpServer {
 
 impl HttpServer {
     pub fn handle_request(&mut self, mut request: Request) -> Response {
-        if let Some(key) = request.headers.get("sec-websocket-key") {
-            let mut response: Response = Status::SwitchingProtocols.into();
-            response.add_header("connection", "upgrade");
-            response.add_header("upgrade", "websocket");
-            response.add_header("sec-websocket-version", "13");
-            response.add_header("sec-websocket-accept", &compute_sec_websocket_accept(key));
-            response.add_header("content-length", "0");
-            return response;
-        }
+        // if let Some(key) = request.headers.get("sec-websocket-key") {
+        //     let mut response: Response = Status::SwitchingProtocols.into();
+        //     response.add_header("connection", "upgrade");
+        //     response.add_header("upgrade", "websocket");
+        //     response.add_header("sec-websocket-version", "13");
+        //     response.add_header("sec-websocket-accept", &compute_sec_websocket_accept(key));
+        //     response.add_header("content-length", "0");
+        //     return response;
+        // }
         let mut response = ().into();
         for service in &mut self.services {
             //println!("service path: {:?}, request path: {:?}", service.path, request.path);

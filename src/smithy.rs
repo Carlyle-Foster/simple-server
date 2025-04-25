@@ -34,10 +34,10 @@ impl HttpSmith for HttpSmithText {
 
         (data, response.body.clone())
     }
-    fn deserialize<'buf>(&self, bytes: &'buf [u8]) -> Result<(Request, &'buf [u8]), ParseError> {
+    fn deserialize<'buf>(&self, bytes: &'buf [u8]) -> Result<(Request, u64), ParseError> {
         use ParseError::*;
         
-        let (header, mut bytes) = header_from_bytes(bytes)?;
+        let (header, mut rest) = header_from_bytes(bytes)?;
         //println!("{header}");
         let lines: Vec<&str> = header.split("\r\n").collect();
         let (request_line, headers) = lines.split_at_checked(1).ok_or(EmptyRequest)?;
@@ -76,12 +76,12 @@ impl HttpSmith for HttpSmithText {
             if key == "content-length" {
                 let content_length = value.parse().map_err(|_| ContentLengthNotAnInteger )?;
                 let body;
-                (body, bytes) = bytes.split_at_checked(content_length).ok_or(Incomplete)?;
+                (body, rest) = rest.split_at_checked(content_length).ok_or(Incomplete)?;
                 request.body = body.to_owned()
             }
             request.headers.insert(key, value);
         }
-        return Ok((request, bytes));
+        return Ok((request, (bytes.len() - rest.len()) as u64));
     }
 }
 

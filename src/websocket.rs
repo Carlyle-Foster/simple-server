@@ -5,7 +5,7 @@ use mio::Token;
 use sha1::{Digest, Sha1};
 use base64::prelude::*;
 
-use crate::{helpers::Write2, serve_client, ClientManifest, Protocol, Vfs, TLS::TLStream};
+use crate::{helpers::Write2, serve_client, Client, Protocol, Vfs, TLS::TLStream};
 
 pub fn compute_sec_websocket_accept(key: &str) -> String {
     let mut sha1 = Sha1::new();
@@ -19,7 +19,7 @@ pub struct WebSocket {
     receiver: Receiver<TLStream>,
     queue: mio::Events,
     poll: mio::Poll,
-    clients: ClientManifest,
+    clients: HashMap<u64, Client>,
 }
 
 impl WebSocket {
@@ -29,7 +29,7 @@ impl WebSocket {
             receiver, 
             queue: mio::Events::with_capacity(128),
             poll: mio::Poll::new().unwrap(),
-            clients: ClientManifest::new(128),
+            clients: HashMap::with_capacity(128),
         }
     }
     fn welcome_new_clients(&mut self) {

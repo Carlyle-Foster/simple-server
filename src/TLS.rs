@@ -58,8 +58,8 @@ impl Write2 for TLStream {
             match self.tls.write_tls(&mut self.tcp) {
                 Ok(0) => return Err(ErrorKind::ConnectionAborted.into()),
                 Ok(_) => continue,
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => return Err(ErrorKind::WouldBlock.into()),
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Err(ErrorKind::WouldBlock.into()),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
         };
@@ -75,8 +75,8 @@ impl Read2 for TLStream {
                 match self.tls.read_tls(&mut self.tcp) {
                     Ok(0) => return (bytes_read, Err(ErrorKind::ConnectionAborted.into())),
                     Ok(_) => {},
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => return (bytes_read, Err(ErrorKind::WouldBlock.into())),
-                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return (bytes_read, Err(ErrorKind::WouldBlock.into())),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(e) => return (bytes_read, Err(e)),
                 }
                 match self.tls.process_new_packets() {
