@@ -1,9 +1,7 @@
-use std::{io::{self, ErrorKind, Write}, sync::Arc};
+use std::{io::{self, ErrorKind, Read, Write}, sync::Arc};
 
 use mio::{event, net::TcpStream};
 use rustls::{ServerConnection, ServerConfig};
-
-use crate::helpers::{Read2, Write2};
 
 pub struct TLStream {
     pub tcp: TcpStream,
@@ -55,43 +53,32 @@ impl TLStream {
             }
         }
     }
+    pub fn read_from(&mut self, deliverer: &mut impl Write) -> io::Result<()> {
+        io::copy(self, deliverer)?;
+        deliverer.flush()?;
+        Ok(())
+    }
+    pub fn write_to(&mut self, delivery: &mut impl Read) -> io::Result<()> {
+        io::copy(delivery, self)?;
+        self.flush()?;
+        Ok(())
+    }
 }
 
-impl Write2 for TLStream {
-    fn write2(&mut self, buffer: &[u8]) -> (usize, io::Result<()>) {
-        let mut bytes_writ = 0;
-        loop {
-            let mut tcp_used = false;
-            let mut tls_used = false;
-            while self.tls.wants_write() {
-                match self.tls.write_tls(&mut self.tcp) {
-                    Ok(0) => {return (bytes_writ, Err(ErrorKind::ConnectionAborted.into()))},
-                    Ok(_) => { tls_used = true },
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(e) => return (bytes_writ, Err(e)),
-                };
+impl Write for TLStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        while self.tls.wants_write() {
+            match self.tls.write_tls(&mut self.tcp) {
+                Ok(0) => return Ok(0),
+                Ok(_) => {},
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             };
-            let (bytes, error) = self.tls.writer().write2(&buffer[bytes_writ..]);
-            if bytes > 0 {
-                bytes_writ += bytes;
-                tcp_used = true;
-            }
-            if error.is_err() {
-                return (bytes_writ, error);
-            }
-            if !tcp_used && !tls_used {
-                if self.tls.wants_write() {
-                    return (bytes_writ, Err(ErrorKind::WouldBlock.into()));
-                }
-                else {
-                    return (bytes_writ, Ok(()));
-                }
-            }
-        }
+        };
+        self.tls.writer().write(buf)
     }
-
-    fn flush2(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         while self.tls.wants_write() {
             match self.tls.write_tls(&mut self.tcp) {
                 Ok(0) => return Err(ErrorKind::ConnectionAborted.into()),
@@ -105,30 +92,22 @@ impl Write2 for TLStream {
     }
 }
 
-impl Read2 for TLStream {
-    fn read2(&mut self, buffer: &mut [u8]) -> (usize, io::Result<()>) {
-        let mut bytes_read = 0;
-        loop {
-            while self.tls.wants_read() {
-                match self.tls.read_tls(&mut self.tcp) {
-                    Ok(0) => return (bytes_read, Err(ErrorKind::ConnectionAborted.into())),
-                    Ok(_) => {},
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => return (bytes_read, Err(ErrorKind::WouldBlock.into())),
-                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(e) => return (bytes_read, Err(e)),
-                }
-                match self.tls.process_new_packets() {
-                    Ok(_) => {},
-                    Err(_) => return (bytes_read, Err(ErrorKind::ConnectionAborted.into())),
-                }
+impl Read for TLStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        while self.tls.wants_read() {
+            match self.tls.read_tls(&mut self.tcp) {
+                Ok(0) => return Ok(0),
+                Ok(_) => {},
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             }
-            let (bytes, error) = self.tls.reader().read2(&mut buffer[bytes_read..]);
-            bytes_read += bytes;
-            if error.is_err() {
-                return (bytes_read, error);
+            match self.tls.process_new_packets() {
+                Ok(_) => {},
+                Err(_) => return Err(ErrorKind::ConnectionAborted.into()),
             }
-            if !self.tls.wants_read() { return (bytes_read, Ok(())) }
         }
+        self.tls.reader().read(buffer)
     }
 }
 

@@ -16,129 +16,201 @@ use std::io::{Write, ErrorKind};
 use std::io::Read;
 use std::fs::{self};
 use std::net::SocketAddr;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use http::HttpServer;
-use mio::Token;
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll, Token};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use smithy::{HttpSmith, ParseError};
-use TLS2::{ServerEvent, TLServer};
+use TLS::TLStream;
+use TLS2::ClientID;
 
 const SERVER: Token = Token((!0));
 
 pub struct Server {
-    pub clients: HashMap<u64, Client>,
+    pub clients: HashMap<ClientID, Client>,
     pub http: HttpServer,
+
+    pub config: Arc<ServerConfig>,
+    pub listener: TcpListener,
+    pub poll: Poll,
 }
 
 impl Server {
-    pub fn new() -> Self {
+    pub fn new(address: SocketAddr, config: ServerConfig) -> Self {
+        let poll = Poll::new().unwrap();
+        let registry = poll.registry();
+        let mut listener = TcpListener::bind(address).unwrap();
+
+        registry.register(&mut listener, SERVER, Interest::READABLE | Interest::WRITABLE).unwrap();
+
+        println!("HTTPSERVER: initializing server on (https://{}:{})", address.ip(), address.port());
+
         Self { 
             clients: HashMap::with_capacity(1028),
             http: HttpServer::new(),
+
+            config: Arc::new(config),
+            listener,
+            poll,
         }
     }
-    pub fn serve(&mut self, address: SocketAddr, domain_cert: Vec<CertificateDer<'static>>, private_key: PrivateKeyDer<'static>) {
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(domain_cert, private_key)
-            .unwrap();
-        let mut tls_server = TLServer::new(address, config);
-
-        println!("HTTPSERVER: serving on (https://{}:{})", address.ip(), address.port());
-
+    pub fn serve(&mut self) {
+        let mut events = Events::with_capacity(64);
         loop {
-            let (id, event) = tls_server.serve().unwrap_or_else(|e| panic!("HTTPSERVER_CRASHED (on account of {e})"));
-            println!("{event:?}, id = {id}");
-            match event {
-                ServerEvent::CLIENT_JOINED => {
-                    let newcomer = Client::new(id, Protocol::HTTP);
-                    self.clients.insert(id, newcomer);
-                },
-                ServerEvent::CLIENT_READABLE => {
-                    let client = self.clients.get_mut(&id).unwrap();
-                    let (bytes_read, err) = tls_server.read_from_client(id, &mut client.buffer);
-                    match err {
-                        Ok(()) => {},
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => {},
-                        Err(e) => {
-                            tls_server.drop_client(id);
-                            self.clients.remove(&id).unwrap();
-                            println!("HTTP_SERVER: dropped client on account of error when reading: {e}");
+            for event in events.iter() {
+                match event.token() {
+                    SERVER => {
+                        match self.listener.accept() {
+                            Ok((client, _)) => {
+                                self.register(client).unwrap();
+                            }
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                            Err(e) => {
+                                println!("TLServer: connection refused due to error accepting: {:?}", e);
+                            },
+                        }
+                    }
+                    client => {
+                        let id = client.0 as ClientID;
+                        let client = self.clients.get_mut(&id).unwrap();
+                        let stream = &mut client.stream;
+                        if stream.tls.is_handshaking() {
+                            match client.stream.handshake() {
+                                Ok(_) => {},
+                                Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                                Err(e) if e.kind() == ErrorKind::Interrupted => {},
+                                Err(e) => {
+                                    println!("TLServer: dropped client on account of error when handshaking: {e}");
+                                    self.drop_client(id);
+                                },
+                            };
                             continue
                         }
-                    };
-                    if bytes_read == 0 { continue }
-                    match self.http.smith.deserialize(&client.buffer[..bytes_read as usize]) {
-                        Ok((request, rest)) => {
-                            client.buffer.copy_within(rest as usize.., 0);
-                            client.buffer.resize(client.buffer.len() - rest as usize, 0);
-
-                            let response = self.http.handle_request(request);
-                            let (header, body_path) = self.http.smith.serialize(&response);
-                            //TODO: this panics if u haven't set a 404 page
-                            client.bytes_needed = header.len() + self.http.file_system.get_size(&body_path).unwrap();
-                            client.envelope = header;
-                            client.delivery = body_path;
-                            match self.http.file_system.write2client(client, &mut tls_server) {
+                        if event.is_writable() {
+                            match stream.flush() {
+                                Ok(_) => {},
+                                Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                                Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
+                                    self.drop_client(id);
+                                    break
+                                },
+                                Err(e) => {
+                                    println!("TLServer: dropped client on account of error when flushing: {e}");
+                                    self.drop_client(id);
+                                    break
+                                },
+                            } 
+                            match stream.write_to(&mut client.delivery) {
                                 Ok(()) => {},
                                 Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                                 Err(e) => {
-                                    tls_server.drop_client(id);
-                                    self.clients.remove(&id).unwrap();
                                     println!("HTTP_SERVER: dropped client on account of error when writing: {e}");
+                                    self.drop_client(id);
+                                    break
                                 }
                             };
-                        },
-                        Err(ParseError::Incomplete) => println!("HTTP_SERVER: received request fragment of size {bytes_read}"),
-                        Err(e) => {
-                            tls_server.drop_client(id);
-                            self.clients.remove(&id).unwrap();
-                            println!("HTTP_SERVER: dropped client on account of error when parsing request: {e}");
                         }
+                        if event.is_readable() {
+                            match stream.read_from(&mut client.buf) {
+                                Ok(()) => {},
+                                Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                                Err(e) => {
+                                    println!("HTTP_SERVER: dropped client on account of error when reading: {e}");
+                                    self.drop_client(id);
+                                    continue
+                                }
+                            };
+                            if !client.buf.has_read() { continue }
+                            let story = client.buf.the_story_so_far();
+                            match self.http.smith.deserialize(story) {
+                                Ok((request, rest)) => {
+                                    client.buf.data.copy_within(rest.., 0);
+                                    client.buf.data.resize(client.buf.data.len() - rest, 0);
+                                    client.buf.read = client.buf.data.len();
+                                    client.buf.prev_read = client.buf.read;
 
-                    }
-                },
-                ServerEvent::CLIENT_WRITABLE => {
-                    let client = self.clients.get_mut(&id).unwrap();
-                    match self.http.file_system.write2client(client, &mut tls_server) {
-                        Ok(()) => {},
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => {},
-                        Err(e) => {
-                            tls_server.drop_client(id);
-                            self.clients.remove(&id).unwrap();
-                            println!("HTTP_SERVER: dropped client on account of error when writing: {e}");
+                                    let response = self.http.handle_request(request);
+                                    let (header, body_path) = self.http.smith.serialize(&response);
+                                    //TODO: this panics if u haven't set a 404 page
+                                    client.delivery = Package {
+                                        head: header,
+                                        body: self.http.file_system.get(&body_path).unwrap().clone(),
+                                        writ: 0,
+                                    };
+                                    match stream.write_to(&mut client.delivery) {
+                                        Ok(()) => {},
+                                        Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                                        Err(e) => {
+                                            println!("HTTP_SERVER: dropped client on account of error when writing: {e}");
+                                            self.drop_client(id);
+                                            break
+                                        }
+                                    };
+                                },
+                                Err(ParseError::Incomplete) => println!("HTTP_SERVER: request incomplete at size {}", story.len()),
+                                Err(e) => {
+                                    println!("HTTP_SERVER: dropped client on account of error when parsing request: {e}");
+                                    self.drop_client(id);
+                                    break
+                                }
+
+                            }
                         }
-                    };
-                },
-                ServerEvent::CLIENT_LEFT => {
-                    self.clients.remove(&id).unwrap();
-                },
+                    }
+                }
             }
-        };
+            match self.poll.poll(&mut events, None) {
+                Ok(_) => {},
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => {},
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+    pub fn drop_client(&mut self, id: ClientID) {
+        let client = self.clients.get_mut(&id).unwrap();
+        
+        let registry = self.poll.registry();
+        registry.deregister(&mut client.stream).unwrap();
+
+        self.clients.remove(&id).unwrap();
+    }
+    fn register(&mut self, client: TcpStream) -> io::Result<ClientID> {
+        let registry = self.poll.registry();
+        let mut stream = TLStream::new(client, self.config.clone());
+        let mut id = fastrand::usize(..);
+        while self.clients.contains_key(&id) {
+            id = fastrand::usize(..);
+        }
+        let token = Token(id as usize);
+        let interests = Interest::READABLE | Interest::WRITABLE;
+        registry.register(&mut stream, token, interests)?;
+
+        let client = Client::new(id, Protocol::HTTP, stream);
+        self.clients.insert(id, client);
+
+        return Ok(id)
     }
 }
 
+
 #[derive(Clone)]
-pub struct Vfs(HashMap<Utf8PathBuf, V_file>);
+pub struct Vfs(HashMap<Utf8PathBuf, Rc<V_file>>);
 
 impl Vfs {
-    pub fn get(&mut self, path: &Utf8Path) -> Option<&V_file> {
+    pub fn get(&mut self, path: &Utf8Path) -> Option<Rc<V_file>> {
         self.check_cache(path);
-        self.0.get(path)
+        self.0.get(path).cloned()
     }
-
-    pub fn get_mut(&mut self, path: &Utf8Path) -> Option<&mut V_file> {
-        self.check_cache(path);
-        self.0.get_mut(path)
-    }
-
+    
     fn check_cache(&mut self, path: &Utf8Path) {
         if !self.0.contains_key(path) {
             if let Ok(data) = fs::read(path) {
-                self.0.insert(path.into(), V_file { data });
+                self.0.insert(path.into(), V_file { data }.into());
             }
         }
     }
@@ -146,37 +218,35 @@ impl Vfs {
     pub fn get_size(&mut self, path: &Utf8Path) -> Option<usize> {
         self.get(path).map(|file| file.data.len())
     }
+}
 
-    fn write2client(&mut self, client: &mut Client, server: &mut TLServer) -> io::Result<()> {
-        let payload = match self.get(&client.delivery) {
-            Some(file) => &file.data,
-            None => &Vec::new(),
-        };
-        let mut buffer = &client.envelope;
-        let mut bytes_writ = buffer.len() + payload.len() - client.bytes_needed;
-        while client.bytes_needed > 0 {
-            if (buffer == &client.envelope) && (bytes_writ >= buffer.len()) {
-                bytes_writ -= buffer.len();
-                buffer = payload;
-            };
-            let (bytes, error) = server.write_to_client(client.id, &buffer[bytes_writ..]);
-            bytes_writ += bytes as usize;
-            client.bytes_needed -= bytes as usize;
-            match error {
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
-                Ok(()) => {},
+#[derive(Debug, Clone, Default)]
+pub struct Package {
+    head: Vec<u8>,
+    body: Rc<V_file>,
+    writ: usize,
+}
+
+impl Read for Package {
+    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+        let writ = self.writ;
+        let source = 
+            if writ < self.head.len() {
+                &self.head[writ..]
             }
-        };
-        //TODO: this is very hacky, i'm using Unsupported to signal that the websocket handshake is complete
-        if client.protocol == Protocol::WEBSOCKET && client.bytes_needed == 0 {
-            return Err(ErrorKind::Unsupported.into());
-        }
-        Ok(())
+            else {
+                &Rc::as_ref(&self.body).data[writ - self.head.len()..]
+            };
+        let read = buf.write(source)?;
+        
+        self.writ += read;
+        println!("wrote {read} bytes");
+
+        Ok(read)
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct V_file {
     data: Vec<u8>,
 }
@@ -189,25 +259,53 @@ pub enum Protocol {
     WEBSOCKET,
 }
 
+pub struct Buffer {
+    pub data: Vec<u8>,
+    pub read: usize,
+    pub prev_read: usize,
+}
+
+impl Buffer {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self { data: Vec::with_capacity(cap), read: 0, prev_read: 0 }
+    }
+    pub fn has_read(&self) -> bool { self.prev_read < self.read }
+    pub fn the_story_so_far(&self) -> &[u8] {
+        &self.data[..self.read]
+    }
+}
+
+impl Write for Buffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.prev_read = self.read;
+
+        let writ = self.data.write(&buf[self.read..])?;
+        self.read += writ;
+        //TODO: limit the growth of the buffer
+
+        Ok(writ)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+
 pub struct Client {
-    pub id: u64,
-    pub envelope: Vec<u8>,
-    pub delivery: Utf8PathBuf,
-    pub bytes_needed: usize,
-    pub buffer: Vec<u8>,
-    pub buffer_len: usize,
+    pub id: ClientID,
+    pub stream: TLStream,
+    pub delivery: Package,
+    pub buf: Buffer,
     pub protocol: Protocol,
 }
 
 impl Client {
-    fn new(id: u64, protocol: Protocol) -> Self {
+    fn new(id: ClientID, protocol: Protocol, stream: TLStream) -> Self {
         Self {
             id,
-            envelope: Vec::new(),
-            delivery: "".into(),
-            bytes_needed: 0,
-            buffer: vec![0; 4096], //TODO: maybe this should be less aligned?
-            buffer_len: 0,
+            stream,
+            delivery: Package::default(),
+            buf: Buffer::with_capacity(4096), //TODO: maybe this should be less aligned?
             protocol,
         }
     }

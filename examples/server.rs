@@ -3,11 +3,16 @@ use std::net::SocketAddr;
 use camino::Utf8PathBuf;
 use simple_server::Server;
 use simple_server::http::{Method, Request};
-use simple_server::helpers::{get_domain_certs, get_private_key};
+use simple_server::helpers::{get_domain_certs, get_private_key, get_ssl_config};
 // use simple_server::websocket::{Message, WebSocket, WebSocketError};
 
 fn main() {
-    let mut server = Server::new();
+    let domain_cert = get_domain_certs("https_certificates/domain.cert.pem");
+    let private_key = get_private_key("https_certificates/private.key.pem");
+
+    let config = get_ssl_config(domain_cert, private_key);
+
+    let mut server = Server::new(SocketAddr::from(([127, 0, 0, 1], 8783)), config);
 
     server.http.set_client_directory("client");
     server.http.add_service("/", Method::GET, serve_client_directory());
@@ -15,10 +20,8 @@ fn main() {
     server.http.set_404_page("client/missing.html");
     // server.set_websocket_handler(handle_websocket);
 
-    let domain_cert = get_domain_certs("https_certificates/domain.cert.pem");
-    let private_key = get_private_key("https_certificates/private.key.pem");
+    server.serve();
 
-    server.serve(SocketAddr::from(([127, 0, 0, 1], 8783)), domain_cert, private_key);
 }
 
 fn serve_client_directory() -> impl FnMut(Request) -> Utf8PathBuf {

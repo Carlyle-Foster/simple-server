@@ -1,19 +1,21 @@
-use std::{collections::HashMap, io::{self, ErrorKind}, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, io::{self, ErrorKind, Read, Write}, net::SocketAddr, sync::Arc};
 
 use mio::{net::TcpListener, Events, Interest, Poll, Token};
 use rustls::ServerConfig;
 
-use crate::{helpers::{Read2, Write2}, SERVER, TLS::TLStream};
+use crate::{helpers::{Read2}, SERVER, TLS::TLStream};
 
 pub struct TLServer {
-    config: Arc<ServerConfig>,
-    listener: TcpListener,
-    poll: Poll,
-    events: Events,
-    clients: HashMap<u64, TLStream>,
-    queued_reader: Option<u64>,
-    events_processed: usize,
+    pub config: Arc<ServerConfig>,
+    pub listener: TcpListener,
+    pub poll: Poll,
+    pub events: Events,
+    pub clients: HashMap<ClientID, TLStream>,
+    pub queued_reader: Option<ClientID>,
+    pub events_processed: usize,
 }
+
+pub type ClientID = usize;
 
 #[derive(Debug)]
 pub enum ServerEvent {
@@ -41,7 +43,7 @@ impl TLServer {
             events_processed: 0,
         }
     }
-    pub fn serve(&mut self) -> Result<(u64, ServerEvent), io::Error> {
+    pub fn serve(&mut self) -> Result<(ClientID, ServerEvent), io::Error> {
         if let Some(id) = self.queued_reader.take() {
             return Ok((id, ServerEvent::CLIENT_READABLE));
         }
@@ -53,18 +55,9 @@ impl TLServer {
                     SERVER => {
                         match self.listener.accept() {
                             Ok((connection, _)) => {
-                                let mut id = fastrand::u64(..);
-                                while self.clients.contains_key(&id) {
-                                    id = fastrand::u64(..);
-                                }
-                                let mut stream = TLStream::new(connection, self.config.clone());
-                                let token = Token(id as usize);
-                                let interests = Interest::READABLE | Interest::WRITABLE;
-
-                                let registry = self.poll.registry();
-                                registry.register(&mut stream, token, interests).unwrap();
-
-                                self.clients.insert(id, stream);
+                                let mut client = TLStream::new(connection, self.config.clone());
+                                let id = self.register(&mut client).unwrap();
+                                self.clients.insert(id, client);
 
                                 return Ok((id, ServerEvent::CLIENT_JOINED))
                             }
@@ -75,7 +68,7 @@ impl TLServer {
                         }
                     }
                     client => {
-                        let id = client.0 as u64;
+                        let id = client.0 as ClientID;
                         let stream = self.clients.get_mut(&id).unwrap();
                         if stream.tls.is_handshaking() {
                             match stream.handshake() {
@@ -94,7 +87,7 @@ impl TLServer {
                             if event.is_readable() {
                                 self.queued_reader = Some(id);
                             };
-                            match stream.flush2() {
+                            match stream.flush() {
                                 Ok(_) => {},
                                 Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                                 Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
@@ -119,17 +112,19 @@ impl TLServer {
         }
     }
     /// returns the amount of bytes written into the buffer
-    pub fn read_from_client(&mut self, id: u64, buffer: &mut[u8]) -> (u64, Result<(), io::Error>) {
+    pub fn read_from_client(&mut self, id: ClientID, buffer: &mut[u8]) -> (u64, Result<(), io::Error>) {
         let stream = self.clients.get_mut(&id).unwrap();
         let (bytes_read, err) = stream.read2(buffer);
         (bytes_read as u64, err)
     }
-    pub fn write_to_client(&mut self, id: u64, buffer: &[u8]) -> (u64, Result<(), io::Error>) {
+    pub fn write_to_client(&mut self, id: ClientID, delivery: &mut impl Read) -> io::Result<()> {
         let stream = self.clients.get_mut(&id).unwrap();
-        let (bytes_writ, err) = stream.write2(buffer);
-        (bytes_writ as u64, err)
+        let writ = io::copy(delivery, stream)?;
+        stream.flush()?;
+        println!("finished with {writ} bytes");
+        Ok(())
     }
-    pub fn drop_client(&mut self, id: u64) {
+    pub fn drop_client(&mut self, id: ClientID) {
         let stream = self.clients.get_mut(&id).unwrap();
         
         let registry = self.poll.registry();
@@ -137,11 +132,23 @@ impl TLServer {
 
         self.clients.remove(&id).unwrap();
     }
-    fn poll(&mut self) {
+    pub fn poll(&mut self) {
         match self.poll.poll(&mut self.events, None) {
             Ok(_) => {},
             Err(ref e) if e.kind() == ErrorKind::Interrupted => {},
             Err(e) => panic!("{e}"),
         }
+    }
+    pub fn register(&mut self, client: &mut TLStream) -> io::Result<ClientID> {
+        let registry = self.poll.registry();
+        let mut id = fastrand::usize(..);
+        while self.clients.contains_key(&id) {
+            id = fastrand::usize(..);
+        }
+        let token = Token(id as usize);
+        let interests = Interest::READABLE | Interest::WRITABLE;
+        registry.register(client, token, interests)?;
+
+        return Ok(id)
     }
 }

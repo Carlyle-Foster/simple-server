@@ -9,7 +9,7 @@ use crate::http::*;
 
 pub trait HttpSmith {
     fn serialize(&self, response: &Response) -> (Vec<u8>, Utf8PathBuf);
-    fn deserialize(&self, request: &[u8]) -> Result<(Request, u64), ParseError>;
+    fn deserialize(&self, request: &[u8]) -> Result<(Request, usize), ParseError>;
 }
 
 pub struct HttpSmithText;
@@ -34,7 +34,7 @@ impl HttpSmith for HttpSmithText {
 
         (data, response.body.clone())
     }
-    fn deserialize(&self, bytes: &[u8]) -> Result<(Request, u64), ParseError> {
+    fn deserialize(&self, bytes: &[u8]) -> Result<(Request, usize), ParseError> {
         use ParseError::*;
         
         let (header, mut rest) = header_from_bytes(bytes)?;
@@ -79,7 +79,7 @@ impl HttpSmith for HttpSmithText {
             }
             request.headers.insert(key, value);
         }
-        return Ok((request, (bytes.len() - rest.len()) as u64));
+        return Ok((request, (bytes.len() - rest.len())));
     }
 }
 

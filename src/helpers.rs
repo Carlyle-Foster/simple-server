@@ -21,6 +21,13 @@ pub fn get_private_key(path: &str) -> PrivateKeyDer<'_> {
     PrivateKeyDer::from_pem_file(path).unwrap()
 }
 
+pub fn get_ssl_config(domain_cert: Vec<CertificateDer<'static>>, private_key: PrivateKeyDer<'static>) -> ServerConfig {
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(domain_cert, private_key)
+        .unwrap()
+}
+
 pub fn path_is_sane(path: &Utf8Path) -> bool {
     let mut sane = true;
     for segment in path.components() {
