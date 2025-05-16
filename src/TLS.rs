@@ -1,4 +1,4 @@
-use std::{io::{self, ErrorKind}, sync::Arc};
+use std::{io::{self, ErrorKind, Write}, sync::Arc};
 
 use mio::{event, net::TcpStream};
 use rustls::{ServerConnection, ServerConfig};
@@ -15,6 +15,44 @@ impl TLStream {
         Self {
             tcp, 
             tls: ServerConnection::new(config).unwrap() 
+        }
+    }
+    pub fn handshake(&mut self) -> Result<(), io::Error> {
+        let mut eof = false;
+        loop {
+            let until_handshaked = self.tls.is_handshaking();
+            while self.tls.wants_write() {
+                if self.tls.write_tls(&mut self.tcp)? == 0 {
+                    // EOF
+                    self.tcp.flush()?;
+                    return Ok(())
+                }
+            }
+            self.tcp.flush()?;
+            
+            if !until_handshaked {
+                return Ok(());
+            }
+
+            while !eof && self.tls.wants_read() {
+                match self.tls.read_tls(&mut self.tcp) {
+                    Ok(0) => eof = true,
+                    Ok(_) => break,
+                    Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {},
+                    Err(err) => return Err(err),
+                };
+            }
+            match self.tls.process_new_packets() {
+                Ok(_) => {},
+                Err(_) => return Err(ErrorKind::ConnectionAborted.into()),
+            };
+
+            if until_handshaked && !self.tls.is_handshaking() && self.tls.wants_write() {
+                continue
+            }
+            if eof {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+            }
         }
     }
 }

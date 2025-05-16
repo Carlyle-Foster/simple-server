@@ -2,3 +2,5 @@
 /https_certificates
 *.pem
 docker
+*.changelog
+*.modtimes

@@ -1,3 +1,3 @@
 #!/bin/sh
 cargo build --example server
-rlwrap target/debug/examples/server
+rust-gdb -ex run target/debug/examples/server

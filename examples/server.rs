@@ -1,20 +1,18 @@
 use std::net::SocketAddr;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
 
 use camino::Utf8PathBuf;
-use simple_server::http::HttpServer;
+use simple_server::Server;
 use simple_server::http::{Method, Request};
 use simple_server::helpers::{get_domain_certs, get_private_key};
 // use simple_server::websocket::{Message, WebSocket, WebSocketError};
 
 fn main() {
-    let mut server = HttpServer::new();
+    let mut server = Server::new();
 
-    server.set_client_directory("client");
-    server.add_service("/", Method::GET, serve_client_directory());
-    server.set_homepage("index.html");
-    server.set_404_page("client/missing.html");
+    server.http.set_client_directory("client");
+    server.http.add_service("/", Method::GET, serve_client_directory());
+    server.http.set_homepage("index.html");
+    server.http.set_404_page("client/missing.html");
     // server.set_websocket_handler(handle_websocket);
 
     let domain_cert = get_domain_certs("https_certificates/domain.cert.pem");

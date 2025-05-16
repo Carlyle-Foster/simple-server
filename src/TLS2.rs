@@ -5,15 +5,17 @@ use rustls::ServerConfig;
 
 use crate::{helpers::{Read2, Write2}, SERVER, TLS::TLStream};
 
-pub struct TLServer2 {
+pub struct TLServer {
     config: Arc<ServerConfig>,
     listener: TcpListener,
     poll: Poll,
     events: Events,
     clients: HashMap<u64, TLStream>,
     queued_reader: Option<u64>,
+    events_processed: usize,
 }
 
+#[derive(Debug)]
 pub enum ServerEvent {
     CLIENT_JOINED,
     CLIENT_READABLE,
@@ -21,7 +23,7 @@ pub enum ServerEvent {
     CLIENT_LEFT,
 }
 
-impl TLServer2 {
+impl TLServer {
     pub fn new(address: SocketAddr, config: ServerConfig) -> Self {
         let poll = Poll::new().unwrap();
         let registry = poll.registry();
@@ -36,6 +38,7 @@ impl TLServer2 {
             events: Events::with_capacity(64),
             clients: HashMap::with_capacity(1024),
             queued_reader: None,
+            events_processed: 0,
         }
     }
     pub fn serve(&mut self) -> Result<(u64, ServerEvent), io::Error> {
@@ -43,8 +46,9 @@ impl TLServer2 {
             return Ok((id, ServerEvent::CLIENT_READABLE));
         }
         loop {
-            self.poll();
-            for event in self.events.iter() {
+            for event in self.events.iter().skip(self.events_processed) {
+                self.events_processed += 1;
+
                 match event.token() {
                     SERVER => {
                         match self.listener.accept() {
@@ -66,13 +70,26 @@ impl TLServer2 {
                             }
                             Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                             Err(e) => {
-                                println!("TCPSERVER: connection refused due to error accepting: {:?}", e);
+                                println!("TLServer: connection refused due to error accepting: {:?}", e);
                             },
                         }
                     }
-                    token => {
-                        let id = token.0 as u64;
+                    client => {
+                        let id = client.0 as u64;
                         let stream = self.clients.get_mut(&id).unwrap();
+                        if stream.tls.is_handshaking() {
+                            match stream.handshake() {
+                                Ok(_) => {},
+                                Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                                Err(e) if e.kind() == ErrorKind::Interrupted => {},
+                                Err(e) => {
+                                    println!("TLServer: dropped client on account of error when handshaking: {e}");
+                                    self.drop_client(id);
+                                    return Ok((id, ServerEvent::CLIENT_LEFT));
+                                },
+                            };
+                            continue
+                        }
                         if event.is_writable() {
                             if event.is_readable() {
                                 self.queued_reader = Some(id);
@@ -84,8 +101,9 @@ impl TLServer2 {
                                     return Ok((id, ServerEvent::CLIENT_LEFT));
                                 },
                                 Err(e) => {
-                                    println!("TLS_SERVER: dropped client on account of error: {e}");
+                                    println!("TLServer: dropped client on account of error when flushing: {e}");
                                     self.drop_client(id);
+                                    return Ok((id, ServerEvent::CLIENT_LEFT));
                                 },
                             } 
                             return Ok((id, ServerEvent::CLIENT_WRITABLE))
@@ -96,10 +114,12 @@ impl TLServer2 {
                     }
                 }
             }
+            self.events_processed = 0;
+            self.poll();
         }
     }
     /// returns the amount of bytes written into the buffer
-    pub fn read_from_client<'buf>(&mut self, id: u64, buffer: &'buf mut[u8]) -> (u64, Result<(), io::Error>) {
+    pub fn read_from_client(&mut self, id: u64, buffer: &mut[u8]) -> (u64, Result<(), io::Error>) {
         let stream = self.clients.get_mut(&id).unwrap();
         let (bytes_read, err) = stream.read2(buffer);
         (bytes_read as u64, err)

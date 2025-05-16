@@ -9,7 +9,7 @@ use crate::http::*;
 
 pub trait HttpSmith {
     fn serialize(&self, response: &Response) -> (Vec<u8>, Utf8PathBuf);
-    fn deserialize<'buf>(&self, request: &'buf [u8]) -> Result<(Request, &'buf [u8]), ParseError>;
+    fn deserialize(&self, request: &[u8]) -> Result<(Request, u64), ParseError>;
 }
 
 pub struct HttpSmithText;
@@ -34,7 +34,7 @@ impl HttpSmith for HttpSmithText {
 
         (data, response.body.clone())
     }
-    fn deserialize<'buf>(&self, bytes: &'buf [u8]) -> Result<(Request, u64), ParseError> {
+    fn deserialize(&self, bytes: &[u8]) -> Result<(Request, u64), ParseError> {
         use ParseError::*;
         
         let (header, mut rest) = header_from_bytes(bytes)?;
@@ -46,8 +46,6 @@ impl HttpSmith for HttpSmithText {
         //REF: https://www.rfc-editor.org/rfc/rfc9112.html#section-2.2-7
         if request_line.len() != 3 { return Err(BadStatusLine); }
 
-        println!("request_line[0] = /{:?}/", request_line[0]);
-        println!("length = /{}/", request_line[0].len());
         let method = Method::parse(request_line[0]).ok_or(BadMethod)?;
         let (path, query_params) = match request_line[1].split_once('?') {
             Some((path, query)) => (path.into(), parse_query_parameters(query)?),

@@ -13,24 +13,113 @@ use std::collections::HashMap;
 use std::io::{self};
 use core::str;
 use std::io::{Write, ErrorKind};
-use std::net::SocketAddr;
 use std::io::Read;
 use std::fs::{self};
-use std::sync::Arc;
+use std::net::SocketAddr;
 
-use helpers::{Read2, Write2};
-use mio::event::Event;
-use TLS::TLStream;
-
-use mio::net::TcpListener;
-use mio::{Events, Interest, Poll, Token};
-
-use rustls::ServerConfig;
+use http::HttpServer;
+use mio::Token;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use TLS2::TLServer2;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
+use smithy::{HttpSmith, ParseError};
+use TLS2::{ServerEvent, TLServer};
 
 const SERVER: Token = Token((!0));
+
+pub struct Server {
+    pub clients: HashMap<u64, Client>,
+    pub http: HttpServer,
+}
+
+impl Server {
+    pub fn new() -> Self {
+        Self { 
+            clients: HashMap::with_capacity(1028),
+            http: HttpServer::new(),
+        }
+    }
+    pub fn serve(&mut self, address: SocketAddr, domain_cert: Vec<CertificateDer<'static>>, private_key: PrivateKeyDer<'static>) {
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(domain_cert, private_key)
+            .unwrap();
+        let mut tls_server = TLServer::new(address, config);
+
+        println!("HTTPSERVER: serving on (https://{}:{})", address.ip(), address.port());
+
+        loop {
+            let (id, event) = tls_server.serve().unwrap_or_else(|e| panic!("HTTPSERVER_CRASHED (on account of {e})"));
+            println!("{event:?}, id = {id}");
+            match event {
+                ServerEvent::CLIENT_JOINED => {
+                    let newcomer = Client::new(id, Protocol::HTTP);
+                    self.clients.insert(id, newcomer);
+                },
+                ServerEvent::CLIENT_READABLE => {
+                    let client = self.clients.get_mut(&id).unwrap();
+                    let (bytes_read, err) = tls_server.read_from_client(id, &mut client.buffer);
+                    match err {
+                        Ok(()) => {},
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                        Err(e) => {
+                            tls_server.drop_client(id);
+                            self.clients.remove(&id).unwrap();
+                            println!("HTTP_SERVER: dropped client on account of error when reading: {e}");
+                            continue
+                        }
+                    };
+                    if bytes_read == 0 { continue }
+                    match self.http.smith.deserialize(&client.buffer[..bytes_read as usize]) {
+                        Ok((request, rest)) => {
+                            client.buffer.copy_within(rest as usize.., 0);
+                            client.buffer.resize(client.buffer.len() - rest as usize, 0);
+
+                            let response = self.http.handle_request(request);
+                            let (header, body_path) = self.http.smith.serialize(&response);
+                            //TODO: this panics if u haven't set a 404 page
+                            client.bytes_needed = header.len() + self.http.file_system.get_size(&body_path).unwrap();
+                            client.envelope = header;
+                            client.delivery = body_path;
+                            match self.http.file_system.write2client(client, &mut tls_server) {
+                                Ok(()) => {},
+                                Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                                Err(e) => {
+                                    tls_server.drop_client(id);
+                                    self.clients.remove(&id).unwrap();
+                                    println!("HTTP_SERVER: dropped client on account of error when writing: {e}");
+                                }
+                            };
+                        },
+                        Err(ParseError::Incomplete) => println!("HTTP_SERVER: received request fragment of size {bytes_read}"),
+                        Err(e) => {
+                            tls_server.drop_client(id);
+                            self.clients.remove(&id).unwrap();
+                            println!("HTTP_SERVER: dropped client on account of error when parsing request: {e}");
+                        }
+
+                    }
+                },
+                ServerEvent::CLIENT_WRITABLE => {
+                    let client = self.clients.get_mut(&id).unwrap();
+                    match self.http.file_system.write2client(client, &mut tls_server) {
+                        Ok(()) => {},
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {},
+                        Err(e) => {
+                            tls_server.drop_client(id);
+                            self.clients.remove(&id).unwrap();
+                            println!("HTTP_SERVER: dropped client on account of error when writing: {e}");
+                        }
+                    };
+                },
+                ServerEvent::CLIENT_LEFT => {
+                    self.clients.remove(&id).unwrap();
+                },
+            }
+        };
+    }
+}
 
 #[derive(Clone)]
 pub struct Vfs(HashMap<Utf8PathBuf, V_file>);
@@ -58,7 +147,7 @@ impl Vfs {
         self.get(path).map(|file| file.data.len())
     }
 
-    fn write2client(&mut self, client: &mut Client, server: &mut TLServer2) -> io::Result<()> {
+    fn write2client(&mut self, client: &mut Client, server: &mut TLServer) -> io::Result<()> {
         let payload = match self.get(&client.delivery) {
             Some(file) => &file.data,
             None => &Vec::new(),
@@ -91,136 +180,6 @@ impl Vfs {
 pub struct V_file {
     data: Vec<u8>,
 }
-            
-// pub struct TLServer {
-//     config: Arc<ServerConfig>,
-//     listener: TcpListener,
-//     poll: Poll,
-// }
-
-// impl TLServer {
-//     pub fn new(address: SocketAddr, config: ServerConfig) -> Self {
-//         let poll = Poll::new().unwrap();
-//         let registry = poll.registry();
-//         let mut listener = TcpListener::bind(address).unwrap();
-
-//         registry.register(&mut listener, SERVER, Interest::READABLE | Interest::WRITABLE).unwrap();
-
-//         Self {
-//             config: Arc::new(config),
-//             listener,
-//             poll,
-//         }
-//     }
-
-//     fn poll(&mut self, events: &mut Events) {
-//         match self.poll.poll(events, None) {
-//             Ok(_) => {},
-//             Err(ref e) if e.kind() == ErrorKind::Interrupted => {},
-//             Err(e) => panic!("{e}"),
-//         }
-//     }
-
-//     fn serve<'buf>(&mut self, file_system: &mut Vfs, connections: &'buf mut ClientManifest) -> io::Result<(&'buf [u8], Token)> {
-//         let mut events: Events = Events::with_capacity(128);
-//         loop {
-//             self.poll(&mut events);
-//             for event in events.iter() {
-//                 match event.token() {
-//                     SERVER => {
-//                         match self.listener.accept() {
-//                             Ok((connection, _)) => {
-//                                 let stream = TLStream::new(connection, self.config.clone());
-//                                 connections.insert(stream, Protocol::HTTP, self.poll.registry())?;
-//                             }
-//                             Err(e) if e.kind() == ErrorKind::WouldBlock => {},
-//                             Err(e) => {
-//                                 println!("TCPSERVER: connection refused due to error accepting: {:?}", e);
-//                             },
-//                         }
-//                     }
-//                     token => {
-//                         match serve_client(file_system, event, connections) {
-//                             Ok(0) => {},
-//                             Ok(_) => {
-//                                 let client = connections.get(event.token()).unwrap();
-//                                 return Ok((&client.buffer[..], token))
-//                             },
-//                             Err(e) if e.kind() == ErrorKind::Unsupported => {
-//                                 let client = connections.get(event.token()).unwrap();
-//                                 return Ok((&client.buffer[..0], token))
-//                             },
-//                             Err(e) => {
-//                                 println!("TCP: dropped client {} on account of error {e}", token.0);
-//                                 connections.remove(token);
-//                             }
-//                         };
-//                     }
-//                 }
-//             }
-//         }
-//     }
-
-//     fn dispatch_delivery(&mut self, head: Vec<u8>, body: Utf8PathBuf, file_system: &mut Vfs, connection: &mut Client) -> io::Result<()> {
-//         connection.envelope = head;
-//         connection.delivery = body;
-//         connection.bytes_needed = connection.envelope.len();
-//         if let Some(body_size) = file_system.get_size(&connection.delivery) {
-//             connection.bytes_needed += body_size;
-//         }
-
-//         println!("transmitting {:#?} of size {} to client {}", connection.delivery, connection.bytes_needed, connection.token.0);
-
-//         file_system.write2client(connection)
-//     }
-// }
-
-// fn serve_client(file_system: &mut Vfs, event: &Event, connections: &mut ClientManifest) -> io::Result<usize> {
-//     let token = event.token();
-//     if let Some(client) = connections.get(token) {
-//         client.check_handshake();
-//         let buffer = &mut client.buffer;
-//         if event.is_readable() {
-//             println!("buffer.len() = {}", buffer.len());
-//             let mut bytes_read = 0;
-//             loop {
-//                 let (bytes, error) = client.stream.read2(&mut buffer[bytes_read..]);
-//                 bytes_read += bytes;
-//                 match error {
-//                     Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-//                     Err(e) => return Err(e),
-//                     _ => {},
-//                 }
-//                 if bytes_read >= buffer.len() { buffer.resize(buffer.len() + 4096, 0); }
-//             }
-//             if bytes_read > 0 {
-//                 client.check_handshake();
-//                 return Ok(bytes_read);
-//             }
-//         }
-//         if event.is_writable() {
-//             if client.bytes_needed > 0 {
-//                 match file_system.write2client(client) {
-//                     Ok(()) => {},
-//                     Err(e) => return Err(e)
-//                 }
-//             }
-//             else {
-//                 match client.stream.flush2() {
-//                     Ok(()) => {},
-//                     Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
-//                     Err(e) => return Err(e),
-//                 } 
-//             }
-//         }
-//         client.check_handshake();
-//     }
-//     else {
-//         println!("TCPSERVER: received invalid ID token {}", token.0);
-//     };
-
-//     Ok(0)
-// }
 
 #[derive(Debug)]
 #[derive(Clone, Copy)]
