@@ -134,6 +134,12 @@ impl From<Request> for Utf8PathBuf {
     }
 }
 
+pub fn reader_to_writer(rd: &mut impl Read, wr: &mut impl Write) -> io::Result<()> {
+    io::copy(rd, wr)?;
+    wr.flush()?;
+    Ok(())
+}
+
 pub trait Read2 {
     fn read2(&mut self, buffer: &mut [u8]) -> (usize, io::Result<()>);
 }

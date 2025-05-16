@@ -53,16 +53,6 @@ impl TLStream {
             }
         }
     }
-    pub fn read_from(&mut self, deliverer: &mut impl Write) -> io::Result<()> {
-        io::copy(self, deliverer)?;
-        deliverer.flush()?;
-        Ok(())
-    }
-    pub fn write_to(&mut self, delivery: &mut impl Read) -> io::Result<()> {
-        io::copy(delivery, self)?;
-        self.flush()?;
-        Ok(())
-    }
 }
 
 impl Write for TLStream {

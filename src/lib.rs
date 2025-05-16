@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use helpers::reader_to_writer;
 use http::HttpServer;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
@@ -105,7 +106,7 @@ impl Server {
                                     break
                                 },
                             } 
-                            match stream.write_to(&mut client.delivery) {
+                            match reader_to_writer(&mut client.delivery, stream) {
                                 Ok(()) => {},
                                 Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                                 Err(e) => {
@@ -116,7 +117,7 @@ impl Server {
                             };
                         }
                         if event.is_readable() {
-                            match stream.read_from(&mut client.buf) {
+                            match reader_to_writer(stream, &mut client.buf) {
                                 Ok(()) => {},
                                 Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                                 Err(e) => {
@@ -142,7 +143,7 @@ impl Server {
                                         body: self.http.file_system.get(&body_path).unwrap().clone(),
                                         writ: 0,
                                     };
-                                    match stream.write_to(&mut client.delivery) {
+                                    match reader_to_writer(&mut client.delivery, stream) {
                                         Ok(()) => {},
                                         Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                                         Err(e) => {
