@@ -14,10 +14,10 @@ fn main() {
 
     let mut server = Server::new(SocketAddr::from(([127, 0, 0, 1], 8783)), config);
 
-    server.http.set_client_directory("client");
+    server.http.set_client_directory("fake_server/src");
     server.http.add_service("/", Method::GET, serve_client_directory());
     server.http.set_homepage("index.html");
-    server.http.set_404_page("client/missing.html");
+    server.http.set_404_page("missing.html");
     // server.set_websocket_handler(handle_websocket);
 
     server.serve();

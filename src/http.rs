@@ -36,7 +36,6 @@ impl Service {
 
 pub struct HttpServer {
     pub services: Vec<Service>,
-    pub client_directory: Utf8PathBuf,
     pub homepage: Utf8PathBuf,
     pub not_found: Utf8PathBuf,
     pub file_system: Vfs,
@@ -48,10 +47,12 @@ impl HttpServer {
     pub fn new() -> Self {
         Self {
             services: Vec::with_capacity(4),
-            client_directory: Utf8PathBuf::new(),
             homepage: Utf8PathBuf::new(),
             not_found: Utf8PathBuf::new(),
-            file_system: Vfs(HashMap::new()),
+            file_system: Vfs {
+                files: HashMap::new(),
+                client_dir: Utf8PathBuf::new()
+            },
             smith: HttpSmithText{},
             websocket: None,
         }
@@ -66,12 +67,14 @@ impl HttpServer {
     }
     pub fn set_homepage(&mut self, path: &str) {
         self.homepage = path.into();
+        self.file_system.sync_with_file_system(path.into()).unwrap();
     }
     pub fn set_404_page(&mut self, path: &str) {
         self.not_found = path.into();
+        self.file_system.sync_with_file_system(path.into()).unwrap();
     }
     pub fn set_client_directory(&mut self, path: &str) {
-        self.client_directory = path.into();
+        self.file_system.client_dir = path.into();
     }
 }
 
@@ -106,7 +109,6 @@ impl HttpServer {
             response.body = self.homepage.clone();
         }
         if !path_is_sane(&response.body) { dropped = true }
-        response.body = self.client_directory.clone().join(&response.body);
         let mut body_size = 0;
         match self.file_system.get(&response.body) {
             Some(file) => body_size = file.data.len(),

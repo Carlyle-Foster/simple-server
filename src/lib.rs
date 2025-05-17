@@ -18,6 +18,7 @@ use std::fs::{self};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use helpers::reader_to_writer;
 use http::HttpServer;
@@ -39,6 +40,8 @@ pub struct Server {
     pub config: Arc<ServerConfig>,
     pub listener: TcpListener,
     pub poll: Poll,
+    pub last_refresh: Instant,
+    pub last_push: SystemTime,
 }
 
 impl Server {
@@ -58,11 +61,18 @@ impl Server {
             config: Arc::new(config),
             listener,
             poll,
+            last_refresh: Instant::now(),
+            last_push: SystemTime::now(),
         }
     }
     pub fn serve(&mut self) {
         let mut events = Events::with_capacity(64);
         loop {
+            match self.poll.poll(&mut events, Some(Duration::from_millis(400))) {
+                Ok(_) => {},
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => {},
+                Err(e) => panic!("{e}"),
+            }
             for event in events.iter() {
                 match event.token() {
                     SERVER => {
@@ -138,6 +148,7 @@ impl Server {
                                     let response = self.http.handle_request(request);
                                     let (header, body_path) = self.http.smith.serialize(&response);
                                     //TODO: this panics if u haven't set a 404 page
+                                    println!("body_path = {body_path}");
                                     client.delivery = Package {
                                         head: header,
                                         body: self.http.file_system.get(&body_path).unwrap().clone(),
@@ -165,10 +176,31 @@ impl Server {
                     }
                 }
             }
-            match self.poll.poll(&mut events, None) {
-                Ok(_) => {},
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => {},
-                Err(e) => panic!("{e}"),
+            if self.last_refresh.elapsed() > Duration::from_millis(800) {
+                let changelog = self.http.file_system.client_dir.join(".changelog");
+                match fs::metadata(&changelog) {
+                    Ok(md) => {
+                        let last_mod = md.modified().unwrap();
+                        if last_mod > self.last_push {
+                            let changes = fs::read_to_string(&changelog).unwrap();
+                            for line in changes.split("\n\n") {
+                                if let Some(path) = line.strip_prefix("DELETE\t") {
+                                    self.http.file_system.remove(path.into()).unwrap();
+                                }
+                                else {
+                                    let path: &Utf8Path = line.into();
+                                    self.http.file_system.sync_with_file_system(path).unwrap();
+                                }
+                            } 
+                            println!("got ya");
+                        }
+                        println!("attempting to remove {changelog}");
+                        fs::remove_file(changelog).unwrap();
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => { println!("no changelog ")},
+                    Err(e) => println!("HEARTBEAT: failed to open '.changlelog' because of Error: {e}"),
+                }
+                self.last_refresh = Instant::now();
             }
         }
     }
@@ -200,20 +232,27 @@ impl Server {
 
 
 #[derive(Clone)]
-pub struct Vfs(HashMap<Utf8PathBuf, Rc<V_file>>);
+pub struct Vfs {
+    files: HashMap<Utf8PathBuf, Rc<V_file>>,
+    client_dir: Utf8PathBuf,
+}
 
 impl Vfs {
-    pub fn get(&mut self, path: &Utf8Path) -> Option<Rc<V_file>> {
-        self.check_cache(path);
-        self.0.get(path).cloned()
+    pub fn get(&self, path: &Utf8Path) -> Option<Rc<V_file>> {
+        println!("attempted to get {path}, result = {}", self.files.get(path).is_some());
+        self.files.get(path).cloned()
+    }
+
+    pub fn remove(&mut self, path: &Utf8Path) -> Option<Rc<V_file>> {
+        self.files.remove(path)
     }
     
-    fn check_cache(&mut self, path: &Utf8Path) {
-        if !self.0.contains_key(path) {
-            if let Ok(data) = fs::read(path) {
-                self.0.insert(path.into(), V_file { data }.into());
-            }
-        }
+    fn sync_with_file_system(&mut self, path: &Utf8Path) -> io::Result<()> {
+        let data= fs::read(self.client_dir.join(path))?;
+        println!("FILE_SYSTEM: new pair with key = {path}, value from {}", self.client_dir.join(path));
+        self.files.insert(path.into(), V_file { data }.into());
+
+        Ok(())
     }
 
     pub fn get_size(&mut self, path: &Utf8Path) -> Option<usize> {
