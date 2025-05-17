@@ -1,4 +1,5 @@
 use core::str;
+use std::process::exit;
 use std::{collections::HashMap, marker::PhantomData};
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -67,14 +68,37 @@ impl HttpServer {
     }
     pub fn set_homepage(&mut self, path: &str) {
         self.homepage = path.into();
-        self.file_system.sync_with_file_system(path.into()).unwrap();
     }
     pub fn set_404_page(&mut self, path: &str) {
         self.not_found = path.into();
-        self.file_system.sync_with_file_system(path.into()).unwrap();
     }
     pub fn set_client_directory(&mut self, path: &str) {
         self.file_system.client_dir = path.into();
+    }
+    pub(crate) fn init(&mut self) {
+        if self.file_system.client_dir == Utf8PathBuf::new() {
+            println!("ERROR: no client directory set");
+            println!("USAGE: call 'set_client_directory()' b4 'serve()");
+            exit(1);
+        }
+        if self.homepage == Utf8PathBuf::new() {
+            println!("ERROR: no home page set");
+            println!("USAGE: call 'set_homepage()' b4 'serve()");
+            exit(1);
+        }
+        if self.not_found == Utf8PathBuf::new() {
+            println!("ERROR: no 404 page set");
+            println!("USAGE: call 'set_404_page()' b4 'serve()");
+            exit(1);
+        }
+        if let Err(e) = self.file_system.sync_with_file_system(&self.homepage) {
+            println!("SERVER: failed to open the chosen homepage [{}] because of Error: {e}", self.homepage);
+            exit(1)
+        };
+        if let Err(e) = self.file_system.sync_with_file_system(&self.not_found) {
+            println!("SERVER: failed to open the chosen 404 page [{}] because of Error: {e}", self.not_found);
+            exit(1)
+        };
     }
 }
 

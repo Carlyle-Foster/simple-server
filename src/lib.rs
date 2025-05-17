@@ -66,6 +66,7 @@ impl Server {
         }
     }
     pub fn serve(&mut self) {
+        self.http.init();
         let mut events = Events::with_capacity(64);
         loop {
             match self.poll.poll(&mut events, Some(Duration::from_millis(400))) {
@@ -185,11 +186,19 @@ impl Server {
                             let changes = fs::read_to_string(&changelog).unwrap();
                             for line in changes.split("\n\n") {
                                 if let Some(path) = line.strip_prefix("DELETE\t") {
-                                    self.http.file_system.remove(path.into()).unwrap();
+                                    self.http.file_system.remove(path.into());
                                 }
                                 else {
                                     let path: &Utf8Path = line.into();
-                                    self.http.file_system.sync_with_file_system(path).unwrap();
+                                    if let Err(e) = self.http.file_system.sync_with_file_system(path) {
+                                        let sys_path = self.http.file_system.client_dir.join(path);
+                                        if e.kind() == ErrorKind::NotFound {
+                                            println!("FILE_SYSTEM: attemped to sync with nonexistant file at {sys_path}. @suspicious");
+                                        }
+                                        else {
+                                            println!("FILE_SYSTEM: failed to read file at {sys_path} because of Error: {e}");
+                                        }
+                                    };
                                 }
                             } 
                             println!("got ya");
@@ -243,16 +252,36 @@ impl Vfs {
         self.files.get(path).cloned()
     }
 
-    pub fn remove(&mut self, path: &Utf8Path) -> Option<Rc<V_file>> {
-        self.files.remove(path)
+    pub fn remove(&mut self, path: &Utf8Path) {
+        if self.files.remove(path).is_none() {
+            println!("FILE_SYSTEM: attemped to uncache already uncached file. @suspicious")
+        }
     }
     
     fn sync_with_file_system(&mut self, path: &Utf8Path) -> io::Result<()> {
-        let data= fs::read(self.client_dir.join(path))?;
-        println!("FILE_SYSTEM: new pair with key = {path}, value from {}", self.client_dir.join(path));
+        let sys_path = self.client_dir.join(path);
+        let data =  fs::read(&sys_path)?;
+        println!("FILE_SYSTEM: new pair with key = {path}, value from {sys_path}");
         self.files.insert(path.into(), V_file { data }.into());
-
         Ok(())
+    }
+
+    pub fn apply_diff(&mut self, diff: &str) {
+        if let Some(path) = diff.strip_prefix("DELETE\t") {
+            self.remove(path.into());
+        }
+        else {
+            let path: &Utf8Path = diff.into();
+            if let Err(e) = self.sync_with_file_system(path) {
+                let sys_path = self.client_dir.join(path);
+                if e.kind() == ErrorKind::NotFound {
+                    println!("FILE_SYSTEM: attemped to sync with nonexistant file at {sys_path}. @suspicious");
+                }
+                else {
+                    println!("FILE_SYSTEM: failed to read file at {sys_path} because of Error: {e}");
+                }
+            };
+        }
     }
 
     pub fn get_size(&mut self, path: &Utf8Path) -> Option<usize> {
