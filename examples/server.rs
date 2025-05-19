@@ -12,7 +12,7 @@ fn main() {
 
     let config = get_ssl_config(domain_cert, private_key);
 
-    let mut server = Server::new(SocketAddr::from(([127, 0, 0, 1], 8783)), config);
+    let mut server = Server::new(SocketAddr::from(([127, 0, 0, 1], 443)), config);
 
     server.http.set_client_directory("fake_server/src");
     server.http.add_service("/", Method::GET, serve_client_directory());

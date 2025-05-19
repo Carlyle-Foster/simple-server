@@ -5,13 +5,15 @@ use std::error::Error;
 
 use camino::Utf8PathBuf;
 
+use crate::helpers::Parser;
 use crate::http::*;
 
 pub trait HttpSmith {
     fn serialize(&self, response: &Response) -> (Vec<u8>, Utf8PathBuf);
-    fn deserialize(&self, request: &[u8]) -> Result<(Request, usize), ParseError>;
+    fn deserialize<'b>(&self, buf: &'b [u8]) -> Result<(Request, &'b [u8]), ParseError>;
 }
 
+#[derive(Debug, Clone, Copy, Default)]
 pub struct HttpSmithText;
 
 impl HttpSmith for HttpSmithText {
@@ -34,10 +36,10 @@ impl HttpSmith for HttpSmithText {
 
         (data, response.body.clone())
     }
-    fn deserialize(&self, bytes: &[u8]) -> Result<(Request, usize), ParseError> {
+    fn deserialize<'b>(&self, buf: &'b [u8]) -> Result<(Request, &'b [u8]), ParseError> {
         use ParseError::*;
         
-        let (header, mut rest) = header_from_bytes(bytes)?;
+        let (header, mut rest) = header_from_bytes(buf)?;
         //println!("{header}");
         let lines: Vec<&str> = header.split("\r\n").collect();
         let (request_line, headers) = lines.split_at_checked(1).ok_or(EmptyRequest)?;
@@ -79,7 +81,17 @@ impl HttpSmith for HttpSmithText {
             }
             request.headers.insert(key, value);
         }
-        return Ok((request, (bytes.len() - rest.len())));
+        return Ok((request, rest));
+    }
+}
+
+impl<'b> Parser<'b, Request, ParseError> for HttpSmithText {
+    fn parse(&mut self, buf: &'b [u8]) -> Result<(Option<Request>, &'b [u8]), ParseError> {
+        match self.deserialize(buf) {
+            Ok((req, rest)) => Ok((Some(req), rest)),
+            Err(ParseError::Incomplete) => Ok((None, buf)),
+            Err(e) => Err(e),
+        }
     }
 }
 

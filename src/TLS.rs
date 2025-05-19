@@ -42,7 +42,10 @@ impl TLStream {
             }
             match self.tls.process_new_packets() {
                 Ok(_) => {},
-                Err(_) => return Err(ErrorKind::ConnectionAborted.into()),
+                Err(e) => {
+                    println!("rustls error: {e}");
+                    return Err(ErrorKind::ConnectionAborted.into())
+                },
             };
 
             if until_handshaked && !self.tls.is_handshaking() && self.tls.wants_write() {

@@ -134,7 +134,7 @@ impl From<Request> for Utf8PathBuf {
     }
 }
 
-pub fn reader_to_writer(rd: &mut impl Read, wr: &mut impl Write) -> io::Result<()> {
+pub fn throw_reader_at_writer(rd: &mut impl Read, wr: &mut impl Write) -> io::Result<()> {
     io::copy(rd, wr)?;
     wr.flush()?;
     Ok(())
@@ -184,4 +184,29 @@ impl<T: Write> Write2 for T {
     fn flush2(&mut self) -> io::Result<()> {
         self.flush()
     }
+}
+
+pub trait SendTo {
+    fn send_to(&mut self, wr: &mut impl Write) -> io::Result<usize>;
+
+    fn send_all(&mut self, wr: &mut impl Write) -> io::Result<usize> {
+        let mut total = 0;
+        loop {
+            match self.send_to(wr) {
+                Ok(0) => break,
+                Ok(sent) => {
+                    total += sent;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+        };
+        wr.flush()?;
+        Ok(total)
+    }
+}
+
+pub trait Parser<'b, T, E> {
+    /// T is optional so that handshakes can be made to consume bytes transparently
+    fn parse(&mut self, buf: &'b [u8]) -> Result<(Option<T>, &'b [u8]), E>;
 }

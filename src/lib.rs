@@ -5,9 +5,10 @@
 pub mod http;
 pub mod smithy;
 pub mod helpers;
-// pub mod websocket;
+pub mod websocket;
 pub mod TLS;
 pub mod TLS2;
+pub mod server_G;
 
 use std::collections::HashMap;
 use std::io::{self};
@@ -20,21 +21,24 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use helpers::reader_to_writer;
-use http::HttpServer;
+use helpers::{throw_reader_at_writer, SendTo};
+use http::{HttpServer, Request};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rustls::ServerConfig;
-use smithy::{HttpSmith, ParseError};
+use server_G::Server_G;
+use smithy::{HttpSmith, HttpSmithText, ParseError};
 use TLS::TLStream;
-use TLS2::ClientID;
+use TLS2::StreamId;
 
-const SERVER: Token = Token((!0));
+pub type HttpServer2 = Server_G<Package, HttpSmithText, Request, ParseError>;
+
+const SERVER: StreamId = 0;
 
 pub struct Server {
-    pub clients: HashMap<ClientID, Client>,
+    pub clients: HashMap<StreamId, Client>,
     pub http: HttpServer,
 
     pub config: Arc<ServerConfig>,
@@ -50,7 +54,7 @@ impl Server {
         let registry = poll.registry();
         let mut listener = TcpListener::bind(address).unwrap();
 
-        registry.register(&mut listener, SERVER, Interest::READABLE | Interest::WRITABLE).unwrap();
+        registry.register(&mut listener, Token(SERVER), Interest::READABLE | Interest::WRITABLE).unwrap();
 
         println!("HTTPSERVER: initializing server on (https://{}:{})", address.ip(), address.port());
 
@@ -75,7 +79,8 @@ impl Server {
                 Err(e) => panic!("{e}"),
             }
             for event in events.iter() {
-                match event.token() {
+                let id = event.token().0 as StreamId;
+                match id {
                     SERVER => {
                         match self.listener.accept() {
                             Ok((client, _)) => {
@@ -87,8 +92,7 @@ impl Server {
                             },
                         }
                     }
-                    client => {
-                        let id = client.0 as ClientID;
+                    _client => {
                         let client = self.clients.get_mut(&id).unwrap();
                         let stream = &mut client.stream;
                         if stream.tls.is_handshaking() {
@@ -117,8 +121,8 @@ impl Server {
                                     break
                                 },
                             } 
-                            match reader_to_writer(&mut client.delivery, stream) {
-                                Ok(()) => {},
+                            match client.delivery.send_all(stream) {
+                                Ok(_) => {},
                                 Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                                 Err(e) => {
                                     println!("HTTP_SERVER: dropped client on account of error when writing: {e}");
@@ -128,7 +132,7 @@ impl Server {
                             };
                         }
                         if event.is_readable() {
-                            match reader_to_writer(stream, &mut client.buf) {
+                            match throw_reader_at_writer(stream, &mut client.buf) {
                                 Ok(()) => {},
                                 Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                                 Err(e) => {
@@ -140,9 +144,8 @@ impl Server {
                             if !client.buf.has_read() { continue }
                             let story = client.buf.the_story_so_far();
                             match self.http.smith.deserialize(story) {
-                                Ok((request, rest)) => {
-                                    client.buf.data.copy_within(rest.., 0);
-                                    client.buf.data.resize(client.buf.data.len() - rest, 0);
+                                Ok((request, _rest)) => {
+                                    client.buf.data.clear();
                                     client.buf.read = client.buf.data.len();
                                     client.buf.prev_read = client.buf.read;
 
@@ -155,8 +158,8 @@ impl Server {
                                         body: self.http.file_system.get(&body_path).unwrap().clone(),
                                         writ: 0,
                                     };
-                                    match reader_to_writer(&mut client.delivery, stream) {
-                                        Ok(()) => {},
+                                    match client.delivery.send_all(stream) {
+                                        Ok(_) => {},
                                         Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                                         Err(e) => {
                                             println!("HTTP_SERVER: dropped client on account of error when writing: {e}");
@@ -213,7 +216,7 @@ impl Server {
             }
         }
     }
-    pub fn drop_client(&mut self, id: ClientID) {
+    pub fn drop_client(&mut self, id: StreamId) {
         let client = self.clients.get_mut(&id).unwrap();
         
         let registry = self.poll.registry();
@@ -221,7 +224,7 @@ impl Server {
 
         self.clients.remove(&id).unwrap();
     }
-    fn register(&mut self, client: TcpStream) -> io::Result<ClientID> {
+    fn register(&mut self, client: TcpStream) -> io::Result<StreamId> {
         let registry = self.poll.registry();
         let mut stream = TLStream::new(client, self.config.clone());
         let mut id = fastrand::usize(..);
@@ -248,7 +251,7 @@ pub struct Vfs {
 
 impl Vfs {
     pub fn get(&self, path: &Utf8Path) -> Option<Rc<V_file>> {
-        println!("attempted to get {path}, result = {}", self.files.get(path).is_some());
+        println!("attempted to get {path}, result = {}", self.files.contains_key(path));
         self.files.get(path).cloned()
     }
 
@@ -296,8 +299,8 @@ pub struct Package {
     writ: usize,
 }
 
-impl Read for Package {
-    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+impl SendTo for Package {
+    fn send_to(&mut self, wr: &mut impl Write) -> io::Result<usize> {
         let writ = self.writ;
         let source = 
             if writ < self.head.len() {
@@ -306,12 +309,17 @@ impl Read for Package {
             else {
                 &Rc::as_ref(&self.body).data[writ - self.head.len()..]
             };
-        let read = buf.write(source)?;
+        let read = wr.write(source)?;
         
         self.writ += read;
         println!("wrote {read} bytes");
 
         Ok(read)
+    }
+}
+impl Read for Package {
+    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+        self.send_to(&mut buf)
     }
 }
 
@@ -361,7 +369,7 @@ impl Write for Buffer {
 
 
 pub struct Client {
-    pub id: ClientID,
+    pub id: StreamId,
     pub stream: TLStream,
     pub delivery: Package,
     pub buf: Buffer,
@@ -369,7 +377,7 @@ pub struct Client {
 }
 
 impl Client {
-    fn new(id: ClientID, protocol: Protocol, stream: TLStream) -> Self {
+    fn new(id: StreamId, protocol: Protocol, stream: TLStream) -> Self {
         Self {
             id,
             stream,
