@@ -92,7 +92,9 @@ impl HttpServer {
             println!("USAGE: call 'set_404_page()' b4 'serve()");
             exit(1);
         }
+
         self.file_system.build_cache();
+        
         if self.file_system.get(&self.homepage).is_none() {
             println!("SERVER: the homepage [{}] is not in the client directory", self.homepage);
             println!("SUGGESTION: maybe u forgot to use a path relative to the client dir?");

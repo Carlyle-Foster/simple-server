@@ -298,14 +298,21 @@ impl Vfs {
         let d = dir.as_ref();
         for file in read_dir(self.client_dir.join(d)).unwrap() {
             if let Ok(f) = file {
-                let name = d.join(f.file_name().to_str().unwrap());
+                let f_ = f.file_name();
+                let name = f_.to_str().unwrap();
+
+                // we ignore dotfiles
+                if name.starts_with('.') {
+                    continue
+                }
+                let path = d.join(name);
                 if f.file_type().unwrap().is_dir() {
-                    self._build_cache(&name)
+                    self._build_cache(&path)
                 }
                 else {
-                    if let Err(e) = self.sync_with_file_system(&name) {
+                    if let Err(e) = self.sync_with_file_system(&path) {
                         //TODO: deduplicate error handling code
-                        let sys_path = self.client_dir.join(name);
+                        let sys_path = self.client_dir.join(path);
                         if e.kind() == ErrorKind::NotFound {
                             println!("FILE_SYSTEM: attemped to sync with nonexistant file at {sys_path}. @suspicious");
                         }
