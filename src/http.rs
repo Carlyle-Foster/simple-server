@@ -4,10 +4,11 @@ use std::{collections::HashMap, marker::PhantomData};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::sync::mpsc;
+use std::fs::{read_dir, ReadDir};
 
 use chrono::{DateTime, Utc};
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::helpers::path_is_sane;
 use crate::smithy::HttpSmithText;
@@ -91,12 +92,15 @@ impl HttpServer {
             println!("USAGE: call 'set_404_page()' b4 'serve()");
             exit(1);
         }
-        if let Err(e) = self.file_system.sync_with_file_system(&self.homepage) {
-            println!("SERVER: failed to open the chosen homepage [{}] because of Error: {e}", self.homepage);
+        self.file_system.build_cache();
+        if self.file_system.get(&self.homepage).is_none() {
+            println!("SERVER: the homepage [{}] is not in the client directory", self.homepage);
+            println!("SUGGESTION: maybe u forgot to use a path relative to the client dir?");
             exit(1)
         };
-        if let Err(e) = self.file_system.sync_with_file_system(&self.not_found) {
-            println!("SERVER: failed to open the chosen 404 page [{}] because of Error: {e}", self.not_found);
+        if self.file_system.get(&self.not_found).is_none() {
+            println!("SERVER: the 404 page [{}] is not in the client directory", self.not_found);
+            println!("SUGGESTION: maybe u forgot to use a path relative to the client dir?");
             exit(1)
         };
     }

@@ -15,7 +15,7 @@ use std::io::{self};
 use core::str;
 use std::io::{Write, ErrorKind};
 use std::io::Read;
-use std::fs::{self};
+use std::fs::{self, read_dir};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -209,7 +209,7 @@ impl Server {
                         println!("attempting to remove {changelog}");
                         fs::remove_file(changelog).unwrap();
                     }
-                    Err(e) if e.kind() == ErrorKind::NotFound => { println!("no changelog ")},
+                    Err(e) if e.kind() == ErrorKind::NotFound => { println!(".")},
                     Err(e) => println!("HEARTBEAT: failed to open '.changlelog' because of Error: {e}"),
                 }
                 self.last_refresh = Instant::now();
@@ -290,6 +290,33 @@ impl Vfs {
     pub fn get_size(&mut self, path: &Utf8Path) -> Option<usize> {
         self.get(path).map(|file| file.data.len())
     }
+
+    fn build_cache(&mut self) {
+        self._build_cache("");
+    }
+    fn _build_cache(&mut self, dir: impl AsRef<Utf8Path>) {
+        let d = dir.as_ref();
+        for file in read_dir(self.client_dir.join(d)).unwrap() {
+            if let Ok(f) = file {
+                let name = d.join(f.file_name().to_str().unwrap());
+                if f.file_type().unwrap().is_dir() {
+                    self._build_cache(&name)
+                }
+                else {
+                    if let Err(e) = self.sync_with_file_system(&name) {
+                        //TODO: deduplicate error handling code
+                        let sys_path = self.client_dir.join(name);
+                        if e.kind() == ErrorKind::NotFound {
+                            println!("FILE_SYSTEM: attemped to sync with nonexistant file at {sys_path}. @suspicious");
+                        }
+                        else {
+                            println!("FILE_SYSTEM: failed to read file at {sys_path} because of Error: {e}");
+                        }
+                    }
+                }
+            }
+    }
+}
 }
 
 #[derive(Debug, Clone, Default)]
