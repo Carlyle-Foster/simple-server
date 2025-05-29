@@ -16,11 +16,11 @@ fn main() {
 
     let mut dots = 0;
     loop {
-        for notif in server.into_iter() {
-            match notif {
-            Notification::SentMessage(id, request) => {
+        match server.serve() {
+            Notification::SentMessage(id, message) => {
                 println!("client {id} sent:");
-                println!("{request:#?}");
+                println!("{message:#?}");
+                server.send_message(id, message);
             }
             Notification::Disconnected(id) => {
                 println!("client {id} disconnected")
@@ -32,7 +32,6 @@ fn main() {
                 println!();
                 dots += 1;
                 dots = dots % 4;
-            }
             }
         }
     }
