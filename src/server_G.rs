@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{collections::HashMap, io::{self, ErrorKind, Write}, marker::PhantomData, mem::transmute, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use std::{collections::HashMap, io::{self, ErrorKind, Write}, marker::PhantomData, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 
 use mio::{net::{TcpListener, TcpStream}, Events, Interest, Poll, Token};
 use rustls::ServerConfig;
@@ -64,8 +64,7 @@ where
                 time = Some(timer)
             }
             if self.events.iter().nth(self.events_processed).is_none() {
-                //TODO: this is undefined behavior on windows, where Events is not just a Vec<Event>
-                match self.poll.poll(unsafe { transmute(&mut self.events) }, time) {
+                match self.poll.poll(&mut self.events, time) {
                     Ok(_) => {},
                     Err(ref e) if e.kind() == ErrorKind::Interrupted => {},
                     Err(e) => panic!("{e}"),
