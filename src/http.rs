@@ -4,11 +4,10 @@ use std::{collections::HashMap, marker::PhantomData};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::sync::mpsc;
-use std::fs::{read_dir, ReadDir};
 
 use chrono::{DateTime, Utc};
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 
 use crate::helpers::path_is_sane;
 use crate::smithy::HttpSmithText;
@@ -94,7 +93,7 @@ impl HttpServer {
         }
 
         self.file_system.build_cache();
-        
+
         if self.file_system.get(&self.homepage).is_none() {
             println!("SERVER: the homepage [{}] is not in the client directory", self.homepage);
             println!("SUGGESTION: maybe u forgot to use a path relative to the client dir?");

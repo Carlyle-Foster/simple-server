@@ -193,15 +193,7 @@ impl Server {
                                 }
                                 else {
                                     let path: &Utf8Path = line.into();
-                                    if let Err(e) = self.http.file_system.sync_with_file_system(path) {
-                                        let sys_path = self.http.file_system.client_dir.join(path);
-                                        if e.kind() == ErrorKind::NotFound {
-                                            println!("FILE_SYSTEM: attemped to sync with nonexistant file at {sys_path}. @suspicious");
-                                        }
-                                        else {
-                                            println!("FILE_SYSTEM: failed to read file at {sys_path} because of Error: {e}");
-                                        }
-                                    };
+                                    self.http.file_system.sync_with_file_system(path);
                                 }
                             } 
                             println!("got ya");
@@ -261,12 +253,20 @@ impl Vfs {
         }
     }
     
-    fn sync_with_file_system(&mut self, path: &Utf8Path) -> io::Result<()> {
+    fn sync_with_file_system(&mut self, path: &Utf8Path) {
         let sys_path = self.client_dir.join(path);
-        let data =  fs::read(&sys_path)?;
-        println!("FILE_SYSTEM: new pair with key = {path}, value from {sys_path}");
-        self.files.insert(path.into(), V_file { data }.into());
-        Ok(())
+        match fs::read(&sys_path) {
+            Ok(data) => {
+                println!("FILE_SYSTEM: new pair with key = {path}, value from {sys_path}");
+                self.files.insert(path.into(), V_file { data }.into());
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                println!("FILE_SYSTEM: attemped to sync with nonexistant file at {sys_path}. @suspicious");
+            }
+            Err(e) => {
+                println!("FILE_SYSTEM: failed to read file at {sys_path} because of Error: {e}");
+            }
+        }
     }
 
     pub fn apply_diff(&mut self, diff: &str) {
@@ -275,15 +275,7 @@ impl Vfs {
         }
         else {
             let path: &Utf8Path = diff.into();
-            if let Err(e) = self.sync_with_file_system(path) {
-                let sys_path = self.client_dir.join(path);
-                if e.kind() == ErrorKind::NotFound {
-                    println!("FILE_SYSTEM: attemped to sync with nonexistant file at {sys_path}. @suspicious");
-                }
-                else {
-                    println!("FILE_SYSTEM: failed to read file at {sys_path} because of Error: {e}");
-                }
-            };
+            self.sync_with_file_system(path);
         }
     }
 
@@ -296,31 +288,21 @@ impl Vfs {
     }
     fn _build_cache(&mut self, dir: impl AsRef<Utf8Path>) {
         let d = dir.as_ref();
-        for file in read_dir(self.client_dir.join(d)).unwrap() {
-            if let Ok(f) = file {
-                let f_ = f.file_name();
-                let name = f_.to_str().unwrap();
+        let iter = read_dir(self.client_dir.join(d)).unwrap();
+        for f in iter.flatten() {
+            let f_ = f.file_name();
+            let name = f_.to_str().unwrap();
 
-                // we ignore dotfiles
-                if name.starts_with('.') {
-                    continue
-                }
-                let path = d.join(name);
-                if f.file_type().unwrap().is_dir() {
-                    self._build_cache(&path)
-                }
-                else {
-                    if let Err(e) = self.sync_with_file_system(&path) {
-                        //TODO: deduplicate error handling code
-                        let sys_path = self.client_dir.join(path);
-                        if e.kind() == ErrorKind::NotFound {
-                            println!("FILE_SYSTEM: attemped to sync with nonexistant file at {sys_path}. @suspicious");
-                        }
-                        else {
-                            println!("FILE_SYSTEM: failed to read file at {sys_path} because of Error: {e}");
-                        }
-                    }
-                }
+            // we ignore dotfiles
+            if name.starts_with('.') {
+                continue
+            }
+            let path = d.join(name);
+            if f.file_type().unwrap().is_dir() {
+                self._build_cache(&path)
+            }
+            else {
+                self.sync_with_file_system(&path)
             }
     }
 }

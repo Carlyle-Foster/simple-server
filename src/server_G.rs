@@ -1,7 +1,7 @@
 use core::fmt;
 use std::{collections::HashMap, io::{self, ErrorKind, Write}, marker::PhantomData, mem::transmute, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 
-use mio::{event::{self, Event}, net::{TcpListener, TcpStream}, Events, Interest, Poll, Token};
+use mio::{net::{TcpListener, TcpStream}, Events, Interest, Poll, Token};
 use rustls::ServerConfig;
 
 use crate::{helpers::{throw_reader_at_writer, Parser, SendTo}, Buffer, SERVER, TLS::TLStream, TLS2::StreamId};
