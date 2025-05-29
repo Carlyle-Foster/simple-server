@@ -1,14 +1,12 @@
 use core::{fmt, str};
-use std::{collections::HashMap, error::Error, io::{self, ErrorKind, Write}, mem, sync::Arc, time::Duration};
+use std::{error::Error, io::{self, Write}, mem};
 
-use mio::{net::{TcpListener, TcpStream}, Interest, Token};
-use rustls::ServerConfig;
 use sha1::{Digest, Sha1};
 use base64::prelude::*;
 
-use crate::{helpers::{throw_reader_at_writer, Parser, SendTo}, http::Request, server_G::Server_G, smithy::HttpSmithText, Client, Protocol, SERVER, TLS::TLStream, TLS2::StreamId};
+use crate::{helpers::{Parser, SendTo}, http, server_G::{HandshakeStatus, Handshaker, Server_G}, smithy::{self, HttpSmith, HttpSmithText}, TLS2::StreamId};
 
-pub type WsServer = Server_G<Messenger, WsParser, Message, WebSocketError>;
+pub type WsServer = Server_G<Messenger, WsParser, Message, WebSocketError, WsHandshaker>;
 
 impl WsServer {
     pub fn send_message(&mut self, id: StreamId, message: impl Into<Message>) {
@@ -23,214 +21,77 @@ pub fn compute_sec_websocket_accept(key: &str) -> String {
     BASE64_STANDARD.encode(sha1.finalize())
 }
 
-pub struct WebSocket {
-    incoming_message: Option<Message>,
-    //TODO: change this
-    // receiver: Receiver<TLStream>,
-    listener: TcpListener,
-    config: Arc<ServerConfig>,
-    queue: mio::Events,
-    poll: mio::Poll,
-    clients: HashMap<StreamId, Client>,
-    events_processed: usize,
-}
-
-impl WebSocket {
-    pub fn new(listener: TcpListener, config: ServerConfig) -> Self {
-        Self {
-            incoming_message: None, 
-            listener,
-            config: Arc::new(config),
-            queue: mio::Events::with_capacity(128),
-            poll: mio::Poll::new().unwrap(),
-            clients: HashMap::with_capacity(128),
-            events_processed: 0,
-        }
-    }
-    pub fn read_message(&mut self) -> Result<(Token, Message), WebSocketError> {
-        use WebSocketError::*;
-
-        // self.welcome_new_clients();
-        loop {
-            match self.poll.poll(&mut self.queue, Some(Duration::from_millis(400))) {
-                Ok(_) => {},
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => {},
-                Err(e) => panic!("{e}"),
-            }
-            while let Some(event) =  self.queue.iter().nth(self.events_processed) {
-                let token = event.token();
-                let id = token.0 as StreamId;
-                self.events_processed += 1;
-                match id {
-                    SERVER => {
-                        match self.listener.accept() {
-                            Ok((client, _)) => {
-                                self.register(client).unwrap();
-                            }
-                            Err(e) if e.kind() == ErrorKind::WouldBlock => {},
-                            Err(e) => {
-                                println!("TLServer: connection refused due to error accepting: {:?}", e);
-                            },
-                        }
-                    }
-                    _client => {
-                        let client = self.clients.get_mut(&id).unwrap();
-                        let stream = &mut client.stream;
-                        if stream.tls.is_handshaking() {
-                            match client.stream.handshake() {
-                                Ok(_) => {},
-                                Err(e) if e.kind() == ErrorKind::WouldBlock => {},
-                                Err(e) if e.kind() == ErrorKind::Interrupted => {},
-                                Err(e) => {
-                                    println!("TLServer: dropped client on account of error when handshaking: {e}");
-                                    self.drop_client(id);
-                                },
-                            };
-                            continue
-                        }
-                        if event.is_writable() {
-                            match stream.flush() {
-                                Ok(_) => {},
-                                Err(e) if e.kind() == ErrorKind::WouldBlock => {},
-                                Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
-                                    self.drop_client(id);
-                                    break
-                                },
-                                Err(e) => {
-                                    println!("TLServer: dropped client on account of error when flushing: {e}");
-                                    self.drop_client(id);
-                                    break
-                                },
-                            } 
-                            match client.delivery.send_all(stream) {
-                                Ok(_) => {},
-                                Err(e) if e.kind() == ErrorKind::WouldBlock => {},
-                                Err(e) => {
-                                    println!("HTTP_SERVER: dropped client on account of error when writing: {e}");
-                                    self.drop_client(id);
-                                    break
-                                }
-                            };
-                        }
-                        if event.is_readable() {
-                            match throw_reader_at_writer(stream, &mut client.buf) {
-                                Ok(()) => {},
-                                Err(e) if e.kind() == ErrorKind::WouldBlock => {},
-                                Err(e) => {
-                                    println!("HTTP_SERVER: dropped client on account of error when reading: {e}");
-                                    self.drop_client(id);
-                                    continue
-                                }
-                            };
-                            if !client.buf.has_read() { continue }
-                            match parse_message(&mut self.incoming_message, client.buf.the_story_so_far()) {
-                                Ok((msg, _rest)) => return Ok((token, msg)),
-                                Err(WOULD_BLOCK) => continue,
-                                Err(e) => {
-                                    println!("HTTP_SERVER: dropped client on account of error when parsing message: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-            self.events_processed = 0;
-        }
-    }
-    fn register(&mut self, client: TcpStream) -> io::Result<StreamId> {
-        let registry = self.poll.registry();
-        let mut stream = TLStream::new(client, self.config.clone());
-        let mut id = fastrand::usize(..);
-        while self.clients.contains_key(&id) {
-            id = fastrand::usize(..);
-        }
-        let token = Token(id as usize);
-        let interests = Interest::READABLE | Interest::WRITABLE;
-        registry.register(&mut stream, token, interests)?;
-
-        let client = Client::new(id, Protocol::HTTP, stream);
-        self.clients.insert(id, client);
-
-        println!("WEBSOCKET: registered client {id}");
-
-        return Ok(id)
-    }
-    //TODO: make multiple versions with different levels of abruptness
-    pub fn drop_client(&mut self, id: StreamId) {
-        let client = self.clients.get_mut(&id).unwrap();
-        
-        let registry = self.poll.registry();
-        registry.deregister(&mut client.stream).unwrap();
-
-        self.clients.remove(&id).unwrap();
-    }
-    pub fn send_binary(&mut self, message: &[u8], client: Token) -> Result<(), WebSocketError> {
-        self.write_message(Message::Binary(message.to_owned()), client)
-    }
-    pub fn send_text(&mut self, message: &str, client: Token) -> Result<(), WebSocketError> {
-        self.write_message(Message::Text(message.to_owned()), client)
-    }
-    fn write_message(&mut self, msg: Message, client: Token) -> Result<(), WebSocketError> {
-        let f: Frame = (&msg).into();
-        let len = f.payload.len();
-        let mut buf = Vec::<u8>::with_capacity(len + 2 + 8);
-        buf.push((1 << 7) | (f.opcode as u8));
-        const limit1: usize = 126;
-        const limit2: usize = 1 << 16;
-        match len {
-            0..limit1 => buf.push(len as u8),
-            limit1..limit2 => {
-                buf.push(limit1 as u8);
-                buf.append(&mut (len as u16).to_be_bytes().to_vec());
-            }
-            limit2.. => {
-                buf.push(127);
-                buf.append(&mut (len as u64).to_be_bytes().to_vec());
-            }
-        }
-        buf.append(&mut f.payload.to_owned());
-        Ok(())
-    }
-}
-
 #[derive(Default, Clone)]
 pub struct WsParser {
     incoming_message: Option<Message>,
     skip: usize,
-    handshaker: HttpSmithText,
-    is_handshaking: bool,
 }
 
 impl Parser<Message, WebSocketError> for WsParser {
     fn parse<'b>(&mut self, buf: &'b [u8]) -> Result<(Option<Message>, &'b [u8]), WebSocketError> {
-        if self.is_handshaking {
-            match self.handshaker.parse(buf) {
-                Ok((Some(handshake), rest)) => {
-                    verify_websocket_handshake(&handshake)?;
-                    self.is_handshaking = true;
-                    self.skip = buf.len() - rest.len();
-                    Ok((None, rest))
-                }
-                Ok((None, rest)) => Ok((None, rest)),
-                Err(_) => Err(WebSocketError::WET_HANDSHAKE),
-            }
-        }
-        else {
-            match parse_message(&mut self.incoming_message, &buf[self.skip..]) {
-                Ok((msg, rest)) => {
-                    self.skip = 0;
-                    Ok((Some(msg), rest))
-                },
-                Err(WebSocketError::WOULD_BLOCK) => Ok((None, buf)),
-                Err(e) => Err(e),
-            }
+        match parse_message(&mut self.incoming_message, &buf[self.skip..]) {
+            Ok((msg, rest)) => {
+                self.skip = 0;
+                Ok((Some(msg), rest))
+            },
+            Err(WebSocketError::WOULD_BLOCK) => Ok((None, buf)),
+            Err(e) => Err(e),
         }
     }
 }
 
-fn verify_websocket_handshake(handshake: &Request) -> Result<(), WebSocketError> {
+#[derive(Debug, Default, Clone)]
+pub struct WsHandshaker {
+    buf: Vec<u8>,
+    bytes_writ: usize,
+    parser: HttpSmithText,
+}
 
-    Ok(())
+impl SendTo for WsHandshaker {
+    fn send_to(&mut self, wr: &mut impl Write) -> io::Result<usize> {
+        let mut slice = (&self.buf[self.bytes_writ..]);
+        let bytes = io::copy(&mut slice, wr)? as usize;
+        self.bytes_writ += bytes;
+        println!("Handshaker: sent {bytes} bytes, bytes_writ = {}", self.bytes_writ);
+
+        Ok(bytes)
+    }
+}
+
+impl Handshaker for WsHandshaker {
+    fn handshake<'b>(&mut self, buf: &'b [u8]) -> Option<(crate::server_G::HandshakeStatus, &'b [u8])> {
+        let len = self.buf.len();
+        debug_assert!(self.bytes_writ <= len);
+        println!("at start, len = {}, bytes_writ = {}", len, self.bytes_writ);
+        if len > 0 {
+            if self.bytes_writ < len {
+                return Some((HandshakeStatus::Responding, buf))
+            }
+            else {
+                return Some((HandshakeStatus::Done, buf))
+            }
+        }
+        match self.parser.deserialize(buf) {
+            Ok((handshake, rest)) => {
+                let key = handshake.headers.get("sec-websocket-key")?;
+                let accept = compute_sec_websocket_accept(key);
+                let mut response: http::Response = http::Status::SwitchingProtocols.into();
+                response.add_header("Upgrade", "websocket");
+                response.add_header("Connection", "Upgrade");
+                // TODO: unecessary clone
+                response.add_header("Sec-WebSocket-Accept", &accept);
+                let (data, _) = self.parser.serialize(&response);
+                println!("WEBSOCKET: handshake response length = {}", data.len());
+                self.buf = data;
+                Some((HandshakeStatus::Responding, rest))
+            }
+            Err(smithy::ParseError::Incomplete) => Some((HandshakeStatus::Waiting, buf)),
+            Err(e) => {
+                println!("WEBSOCKET: handshake Error: {e}");
+                None
+            },
+        }
+    }
 }
 
 fn parse_message<'b>(incoming_message: &mut Option<Message>, mut buf: &'b [u8]) -> Result<(Message, &'b [u8]), WebSocketError> {
@@ -457,6 +318,12 @@ pub struct Messenger {
 impl From<Message> for Messenger {
     fn from(value: Message) -> Self {
         Self { msg: value, writ: 0 }
+    }
+}
+impl From<Vec<u8>> for Messenger {
+    fn from(value: Vec<u8>) -> Self {
+        let m: Message  = value.into();
+        m.into()
     }
 }
 

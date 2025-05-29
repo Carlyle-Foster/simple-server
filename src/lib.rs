@@ -22,18 +22,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use helpers::{throw_reader_at_writer, SendTo};
-use http::{HttpServer, Request};
+use http::HttpServer;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rustls::ServerConfig;
-use server_G::Server_G;
-use smithy::{HttpSmith, HttpSmithText, ParseError};
+use smithy::{HttpSmith, ParseError};
 use TLS::TLStream;
 use TLS2::StreamId;
 
-pub type HttpServer2 = Server_G<Package, HttpSmithText, Request, ParseError>;
+// pub type HttpServer2 = Server_G<Package, HttpSmithText, Request, ParseError>;
 
 const SERVER: StreamId = 0;
 
@@ -352,6 +351,7 @@ pub enum Protocol {
     WEBSOCKET,
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct Buffer {
     pub data: Vec<u8>,
     pub read: usize,
@@ -365,6 +365,13 @@ impl Buffer {
     pub fn has_read(&self) -> bool { self.prev_read < self.read }
     pub fn the_story_so_far(&self) -> &[u8] {
         &self.data[..self.read]
+    }
+    pub fn consume(&mut self, bytes: usize) {
+        let new_len = self.data.len() - bytes;
+        self.data.copy_within(bytes.., 0);
+        self.data.resize(new_len, 0);
+        self.read = new_len;
+        self.prev_read = new_len;
     }
 }
 
