@@ -89,8 +89,8 @@ impl HttpSmith for HttpSmithText {
     }
 }
 
-impl<'b> Parser<'b, Request, ParseError> for HttpSmithText {
-    fn parse(&mut self, buf: &'b [u8]) -> Result<(Option<Request>, &'b [u8]), ParseError> {
+impl Parser<Request, ParseError> for HttpSmithText {
+    fn parse<'b>(&mut self, buf: &'b [u8]) -> Result<(Option<Request>, &'b [u8]), ParseError> {
         match self.deserialize(buf) {
             Ok((req, rest)) => Ok((Some(req), rest)),
             Err(ParseError::Incomplete) => Ok((None, buf)),

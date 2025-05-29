@@ -6,7 +6,7 @@ use rustls::ServerConfig;
 use sha1::{Digest, Sha1};
 use base64::prelude::*;
 
-use crate::{helpers::{throw_reader_at_writer, Parser, SendTo}, server_G::Server_G, smithy::HttpSmithText, Client, Protocol, SERVER, TLS::TLStream, TLS2::StreamId};
+use crate::{helpers::{throw_reader_at_writer, Parser, SendTo}, http::Request, server_G::Server_G, smithy::HttpSmithText, Client, Protocol, SERVER, TLS::TLStream, TLS2::StreamId};
 
 pub type WsServer = Server_G<Messenger, WsParser, Message, WebSocketError>;
 
@@ -201,11 +201,12 @@ pub struct WsParser {
     is_handshaking: bool,
 }
 
-impl<'b> Parser<'b, Message, WebSocketError> for WsParser {
-    fn parse(&mut self, buf: &'b [u8]) -> Result<(Option<Message>, &'b [u8]), WebSocketError> {
+impl Parser<Message, WebSocketError> for WsParser {
+    fn parse<'b>(&mut self, buf: &'b [u8]) -> Result<(Option<Message>, &'b [u8]), WebSocketError> {
         if self.is_handshaking {
             match self.handshaker.parse(buf) {
                 Ok((Some(handshake), rest)) => {
+                    verify_websocket_handshake(&handshake)?;
                     self.is_handshaking = true;
                     self.skip = buf.len() - rest.len();
                     Ok((None, rest))
@@ -227,6 +228,11 @@ impl<'b> Parser<'b, Message, WebSocketError> for WsParser {
     }
 }
 
+fn verify_websocket_handshake(handshake: &Request) -> Result<(), WebSocketError> {
+
+    Ok(())
+}
+
 fn parse_message<'b>(incoming_message: &mut Option<Message>, mut buf: &'b [u8]) -> Result<(Message, &'b [u8]), WebSocketError> {
     use OPCODE::*;
     use WebSocketError::*;
@@ -241,7 +247,7 @@ fn parse_message<'b>(incoming_message: &mut Option<Message>, mut buf: &'b [u8]) 
                         Message::Binary(b) => Message::Binary(frame.unmask_into_binary(mem::take(b))),
                     }.into();
                     if frame.fin { 
-                        return Ok((incoming_message.take().unwrap(), rest)); 
+                        return Ok((incoming_message.take().unwrap(), rest));
                     }
                     continue
                 }

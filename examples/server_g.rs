@@ -1,9 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use mio::net::TcpStream;
-use rustls::ServerConnection;
-use simple_server::{server_G, HttpServer2};
+use simple_server::server_G;
+use simple_server::server_G::Notification;
 use simple_server::websocket::WsServer;
 use simple_server::helpers::{get_domain_certs, get_private_key, get_ssl_config};
 // use simple_server::websocket::{Message, WebSocket, WebSocketError};
@@ -20,26 +19,26 @@ fn main() {
     server.heartbeat = Some(Duration::from_millis(500));
 
     let mut dots = 0;
-    println!("size of Client: {}", size_of::<Cl>());
-    println!("    size of id: {}", size_of::<usize>());
-    println!("    size of TlStream: {}", size_of::<simple_server::TLS::TLStream>());
-    println!("        size of TcpStream: {}", size_of::<TcpStream>());
-    println!("        size of ServerConnection: {}", size_of::<ServerConnection>());
-    println!("    size of buffer: {}", size_of::<simple_server::Buffer>());
-    println!("    size of messenger: {}", size_of::<simple_server::websocket::Messenger>());
-    println!("    size of parser: {}", size_of::<simple_server::websocket::WsParser>());
-    
     loop {
-        for (id, request) in server.into_iter() {
-            println!("id = {id}");
-            println!("{request:#?}");
-        };
-        for _ in 0..dots {
-            print!(".");
+        for notif in server.into_iter() {
+            match notif {
+            Notification::SentMessage(id, request) => {
+                println!("client {id} sent:");
+                println!("{request:#?}");
+            }
+            Notification::Disconnected(id) => {
+                println!("client {id} disconnected")
+            }
+            Notification::Heartbeat => {
+                for _ in 0..dots {
+                    print!(".");
+                }
+                println!();
+                dots += 1;
+                dots = dots % 4;
+            }
+            }
         }
-        println!();
-        dots += 1;
-        dots = dots % 4;
     }
 }
 

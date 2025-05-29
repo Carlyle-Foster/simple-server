@@ -206,7 +206,7 @@ pub trait SendTo {
     }
 }
 
-pub trait Parser<'b, T, E> {
+pub trait Parser<T, E> {
     /// T is optional so that handshakes can be made to consume bytes transparently
-    fn parse(&mut self, buf: &'b [u8]) -> Result<(Option<T>, &'b [u8]), E>;
+    fn parse<'b>(&mut self, buf: &'b [u8]) -> Result<(Option<T>, &'b [u8]), E>;
 }

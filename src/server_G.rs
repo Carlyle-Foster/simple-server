@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{collections::HashMap, io::{self, ErrorKind, Write}, marker::PhantomData, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use std::{collections::HashMap, io::{ErrorKind, Write}, marker::PhantomData, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 
 use mio::{net::{TcpListener, TcpStream}, Events, Interest, Poll, Token};
 use rustls::ServerConfig;
@@ -9,7 +9,7 @@ use crate::{helpers::{throw_reader_at_writer, Parser, SendTo}, Buffer, SERVER, T
 pub struct Server_G<M, P, T, E> 
 where 
     M: SendTo + Default,
-    P: for<'b> Parser<'b, T, E> + Default,
+    P: Parser<T, E> + Default,
     E: fmt::Display,
 {
     pub clients: HashMap<StreamId, Client<M, P, T, E>>,
@@ -19,15 +19,22 @@ where
     pub poll: Poll,
     pub events: Events,
     pub heartbeat: Option<Duration>,
-    pub last_beat: Instant, 
+    pub last_beat: Instant,
     pub events_processed: usize,
     pub id_to_delete: StreamId,
+    pub queued_disconnects: Vec<StreamId>,
+}
+
+pub enum Notification<T> {
+    SentMessage(StreamId, T),
+    Disconnected(StreamId),
+    Heartbeat,
 }
 
 impl<M, P, T, E> Server_G<M, P, T, E> 
 where 
     M: SendTo + Default,
-    P: for<'b> Parser<'b, T, E> + Default,
+    P: Parser<T, E> + Default,
     E: fmt::Display,
 {
     pub fn new(address: SocketAddr, config: ServerConfig) -> Self {
@@ -49,17 +56,21 @@ where
             last_beat: Instant::now(),
             events_processed: 0,
             id_to_delete: 0,
+            queued_disconnects: Vec::with_capacity(64),
         }
     }
-    pub fn serve(&mut self) -> Option<(StreamId, T)> {
+    pub fn serve(&mut self) -> Notification<T> {
         loop {
+            if let Some(id) = self.queued_disconnects.pop() {
+                return Notification::Disconnected(id)
+            }
             let mut time = None;
             let non_blocking = self.heartbeat == Some(Duration::ZERO);
             if let Some(beat) = self.heartbeat {
                 let timer = beat.saturating_sub(self.last_beat.elapsed());
                 self.last_beat = Instant::now();
                 if timer.is_zero() && !non_blocking {
-                    return None
+                    return Notification::Heartbeat
                 }
                 time = Some(timer)
             }
@@ -70,7 +81,7 @@ where
                     Err(e) => panic!("{e}"),
                 }
                 if non_blocking && self.events.is_empty() { 
-                    return None
+                    return Notification::Heartbeat
                 }
             }
             while let Some(event) =  self.events.iter().nth(self.events_processed) {
@@ -80,7 +91,7 @@ where
                     SERVER => {
                         match self.listener.accept() {
                             Ok((client, _)) => {
-                                self.register(client).unwrap();
+                                self.register(client);
                             }
                             Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                             Err(e) => {
@@ -99,6 +110,8 @@ where
                                 Err(e) => {
                                     println!("TLServer: dropped client on account of error when handshaking: {e}");
                                     self.drop_client(id);
+                                    // THE APPLICATION DOESN'T NEED TO KNOW
+                                    let _ = self.queued_disconnects.pop();
                                 },
                             };
                             continue
@@ -109,12 +122,12 @@ where
                                 Err(e) if e.kind() == ErrorKind::WouldBlock => {},
                                 Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
                                     self.drop_client(id);
-                                    break
+                                    continue
                                 },
                                 Err(e) => {
                                     println!("TLServer: dropped client on account of error when flushing: {e}");
                                     self.drop_client(id);
-                                    break
+                                    continue
                                 },
                             } 
                             match client.messenger.send_all(stream) {
@@ -123,7 +136,7 @@ where
                                 Err(e) => {
                                     println!("HTTP_SERVER: dropped client on account of error when writing: {e}");
                                     self.drop_client(id);
-                                    break
+                                    continue
                                 }
                             };
                         }
@@ -147,8 +160,9 @@ where
                                     client.buf.data.resize(new_len, 0);
                                     client.buf.read = new_len;
                                     client.buf.prev_read = new_len;
+                                    client.sent_message = true;
 
-                                    return Some((id, message))
+                                    return Notification::SentMessage(id, message)
                                 },
                                 Ok((None, rest)) => {
                                     if rest == client.buf.data {
@@ -167,7 +181,6 @@ where
                                 Err(e) => {
                                     println!("TLServer: dropped client on account of error when parsing request: {e}");
                                     self.drop_client(id);
-                                    break
                                 },
                             }
                         }
@@ -181,7 +194,10 @@ where
         
         let registry = self.poll.registry();
         registry.deregister(&mut client.stream).unwrap();
-
+        
+        if client.sent_message {
+            self.queued_disconnects.push(id);
+        }
         self.clients.remove(&id).unwrap();
     }
     pub fn send_to_client(&mut self, id: StreamId, message: impl Into<M>) {
@@ -196,7 +212,7 @@ where
             }
         };
     }
-    fn register(&mut self, client: TcpStream) -> io::Result<StreamId> {
+    fn register(&mut self, client: TcpStream) -> StreamId {
         let registry = self.poll.registry();
         let mut stream = TLStream::new(client, self.config.clone());
         let mut id = fastrand::usize(..);
@@ -205,31 +221,31 @@ where
         }
         let token = Token(id as usize);
         let interests = Interest::READABLE | Interest::WRITABLE;
-        registry.register(&mut stream, token, interests)?;
+        registry.register(&mut stream, token, interests).unwrap();
 
         let client = Client::new(id, stream);
         self.clients.insert(id, client);
 
-        return Ok(id)
+        return id
     }
 }
 
 impl<M, P, T, E> Iterator for &mut Server_G<M, P, T, E>
 where 
     M: SendTo + Default,
-    P: for<'b> Parser<'b, T, E> + Default,
+    P: Parser<T, E> + Default,
     E: fmt::Display,
 {
-    type Item = (StreamId, T);
+    type Item = Notification<T>;
     fn next(&mut self) -> Option<Self::Item> {
-        self.serve()
+        Some(self.serve())
     }
 }
 
 pub struct Client<M, P, T, E>
 where 
     M: SendTo + Default,
-    P: for<'b> Parser<'b, T, E> + Default,
+    P: Parser<T, E> + Default,
     E: fmt::Display,
 {
     pub id: StreamId,
@@ -237,6 +253,7 @@ where
     pub buf: Buffer,
     pub messenger: M,
     pub parser: P,
+    pub sent_message: bool,
     t: PhantomData<T>,
     e: PhantomData<E>,
 }
@@ -244,7 +261,7 @@ where
 impl<M, P, T, E> Client<M, P, T, E>
 where 
     M: SendTo + Default,
-    P: for<'b> Parser<'b, T, E> + Default,
+    P: Parser<T, E> + Default,
     E: fmt::Display,
 {
     fn new(id: StreamId, stream: TLStream) -> Self {
@@ -254,6 +271,7 @@ where
             buf: Buffer::with_capacity(4096), //TODO: maybe this should be less aligned?
             messenger: M::default(),
             parser: P::default(),
+            sent_message: false,
             t: PhantomData,
             e: PhantomData,
         }
