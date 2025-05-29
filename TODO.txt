@@ -1,3 +1,5 @@
 implement chunked transfer encoding ala https://www.rfc-editor.org/rfc/rfc9112.html#section-6.1-4
 
 validate transfer encoding https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3-2.4.3
+
+disable SIGPIPE on unix targets
