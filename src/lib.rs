@@ -7,7 +7,6 @@ pub mod smithy;
 pub mod helpers;
 pub mod websocket;
 pub mod TLS;
-pub mod TLS2;
 pub mod server_G;
 
 use std::collections::HashMap;
@@ -30,9 +29,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use rustls::ServerConfig;
 use smithy::{HttpSmith, ParseError};
 use TLS::TLStream;
-use TLS2::StreamId;
 
 // pub type HttpServer2 = Server_G<Package, HttpSmithText, Request, ParseError>;
+
+pub type StreamId = usize;
 
 const SERVER: StreamId = 0;
 

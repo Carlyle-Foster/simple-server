@@ -4,7 +4,7 @@ use std::{error::Error, io::{self, Write}, mem};
 use sha1::{Digest, Sha1};
 use base64::prelude::*;
 
-use crate::{helpers::{Parser, SendTo}, http, server_G::{HandshakeStatus, Handshaker, Server_G}, smithy::{self, HttpSmith, HttpSmithText}, TLS2::StreamId};
+use crate::{helpers::{Parser, SendTo}, http, server_G::{HandshakeStatus, Handshaker, Server_G}, smithy::{self, HttpSmith, HttpSmithText}, StreamId};
 
 pub type WsServer = Server_G<Messenger, WsParser, Message, WebSocketError, WsHandshaker>;
 

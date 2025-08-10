@@ -115,15 +115,6 @@ impl Default for HttpServer {
 
 impl HttpServer {
     pub fn handle_request(&mut self, mut request: Request) -> Response {
-        // if let Some(key) = request.headers.get("sec-websocket-key") {
-        //     let mut response: Response = Status::SwitchingProtocols.into();
-        //     response.add_header("connection", "upgrade");
-        //     response.add_header("upgrade", "websocket");
-        //     response.add_header("sec-websocket-version", "13");
-        //     response.add_header("sec-websocket-accept", &compute_sec_websocket_accept(key));
-        //     response.add_header("content-length", "0");
-        //     return response;
-        // }
         let mut response = ().into();
         for service in &mut self.services {
             //println!("service path: {:?}, request path: {:?}", service.path, request.path);
